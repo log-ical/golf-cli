@@ -1,0 +1,240 @@
+"""HTTP helpers.
+
+Requests reuse keep-alive connections, pooled per scheme and host, so polls
+skip the TCP and TLS handshakes, and ask for gzip. Thread-safe: a connection
+serves one request at a time, and concurrent requests to a host each get
+their own.
+"""
+
+import http.client
+import json
+import select
+import ssl
+import threading
+import time
+import urllib.error
+import urllib.request
+import zlib
+from urllib.parse import urlencode, urljoin, urlsplit
+
+from .term import printable
+
+UA = {"User-Agent": "golf-cli/0.1 (terminal golf viewer)"}
+HEADERS = {**UA, "Accept-Encoding": "gzip, deflate"}
+MAX_REDIRECTS = 5
+# Responses are read into memory, so cap them: the biggest real one (a
+# course with two layouts and every tree mapped) is a few MB decoded.
+MAX_BODY = 8 << 20       # bytes received
+MAX_DECODED = 32 << 20   # bytes after gzip or deflate
+MAX_IDLE = 4      # idle connections kept per host
+IDLE_SECS = 60    # older idle connections are dropped, not reused (wall time,
+                  # so a laptop sleep counts: the monotonic clock stops in sleep)
+# How a reused connection fails when the server closed it while it was idle,
+# or the network changed under it: it goes silent (TimeoutError), resets, or
+# the route is gone (EHOSTUNREACH and the like are plain OSErrors). A fresh
+# connection is tried once, so this can be broad.
+STALE = (OSError, http.client.HTTPException)
+# http.client can't use a proxy by itself; urllib can, so leave those to it.
+PROXIED = any(k in ("http", "https") for k in urllib.request.getproxies())
+
+_ssl = ssl.create_default_context()
+_ssl.set_alpn_protocols(["http/1.1"])
+_pool = {}        # (scheme, host) -> [(idle since, connection)], newest last
+_lock = threading.Lock()
+
+
+def _quiet(conn):
+    """True if nothing has arrived on an idle connection. Anything that did
+    (the server closing it, a 408, bytes past the last response) means it
+    can't carry another request cleanly."""
+    sock = conn.sock
+    if sock is None or (isinstance(sock, ssl.SSLSocket) and sock.pending()):
+        return False
+    try:
+        return not select.select([sock], [], [], 0)[0]
+    except (OSError, ValueError):
+        return False
+
+
+def _checkout(key):
+    """An idle connection to reuse, or None."""
+    with _lock:
+        idle = _pool.get(key) or []
+        while idle:
+            since, conn = idle.pop()
+            if 0 <= time.time() - since < IDLE_SECS and _quiet(conn):
+                return conn
+            conn.close()
+    return None
+
+
+def _drop(key):
+    """Close a host's idle connections: when one has gone bad, so have they."""
+    with _lock:
+        idle = _pool.pop(key, [])
+    for _, conn in idle:
+        conn.close()
+
+
+def _checkin(key, conn):
+    now, expired = time.time(), []
+    with _lock:
+        # Expire every host's old connections, not just this one's, so a
+        # host the app stopped using doesn't keep its sockets for good.
+        for k, idle in list(_pool.items()):
+            expired += [c for since, c in idle if not 0 <= now - since < IDLE_SECS]
+            _pool[k] = [(since, c) for since, c in idle if 0 <= now - since < IDLE_SECS]
+        idle = _pool.setdefault(key, [])
+        if len(idle) < MAX_IDLE:
+            idle.append((now, conn))
+            conn = None
+    for c in expired:
+        c.close()
+    if conn is not None:   # the pool is full
+        conn.close()
+
+
+def _get(scheme, host, path, timeout, extra=None):
+    """One GET with the body read in full: (response, raw body)."""
+    key = (scheme, host)
+    conn = _checkout(key)
+    while True:
+        reused = conn is not None
+        if reused:
+            conn.timeout = timeout
+            conn.sock.settimeout(timeout)
+        elif scheme == "https":
+            conn = http.client.HTTPSConnection(host, timeout=timeout, context=_ssl)
+        else:
+            conn = http.client.HTTPConnection(host, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={**HEADERS, **(extra or {})})
+            r = conn.getresponse()
+            body = _read(r)
+        except Exception as e:
+            conn.close()
+            if reused and isinstance(e, STALE):
+                _drop(key)
+                conn = None   # went stale while idle: retry once on a new connection
+                continue
+            raise
+        # http.client takes an interim response (103 Early Hints) for the
+        # answer, leaving the real one unread: such a connection can't be reused.
+        if r.will_close or r.status < 200:
+            conn.close()
+        else:
+            _checkin(key, conn)
+        return r, body
+
+
+def _read(r):
+    body = r.read(MAX_BODY + 1)
+    if len(body) > MAX_BODY:
+        raise ValueError("response too large")
+    return body
+
+
+def _inflate(body, wbits):
+    d = zlib.decompressobj(wbits)
+    out = d.decompress(body, MAX_DECODED) + (b"" if d.unconsumed_tail else d.flush())
+    if d.unconsumed_tail or len(out) > MAX_DECODED:
+        raise ValueError("response too large")
+    if not d.eof:
+        raise ValueError("truncated %s data" % ("gzip" if wbits > zlib.MAX_WBITS else "deflate"))
+    return out
+
+
+def _decode(body, encoding):
+    encoding = (encoding or "").strip().lower()
+    if encoding in ("gzip", "x-gzip"):
+        return _inflate(body, 16 + zlib.MAX_WBITS)
+    if encoding == "deflate":
+        try:
+            return _inflate(body, zlib.MAX_WBITS)
+        except zlib.error:   # some servers send raw deflate, without the zlib wrapper
+            return _inflate(body, -zlib.MAX_WBITS)
+    return body
+
+
+
+class _Redirects(urllib.request.HTTPRedirectHandler):
+    """urllib's redirects (when a proxy is set) under the same rules as ours:
+    only http(s), and never https to http."""
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urlsplit(newurl).scheme
+        if scheme not in ("http", "https") or (req.type == "https" and scheme != "https"):
+            raise urllib.error.HTTPError(newurl, code, "redirect to %s refused" % scheme, headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_Redirects)
+
+
+def _open(url, timeout, extra=None):
+    """GET url, following redirects: (final response, decoded body).
+
+    Raises urllib.error.HTTPError for non-2xx statuses, like urlopen.
+    """
+    if PROXIED:
+        req = urllib.request.Request(url, headers={**HEADERS, **(extra or {})})
+        with _opener.open(req, timeout=timeout) as r:
+            return r, _decode(_read(r), r.headers.get("Content-Encoding"))
+    for _ in range(MAX_REDIRECTS + 1):
+        u = urlsplit(url)
+        if u.scheme not in ("http", "https") or not u.netloc:
+            raise ValueError("unsupported URL: %r" % url)
+        r, body = _get(u.scheme, u.netloc, (u.path or "/") + ("?" + u.query if u.query else ""), timeout, extra)
+        location = r.headers.get("Location")
+        if r.status in (301, 302, 303, 307, 308) and location:
+            new = urljoin(url, location)
+            if u.scheme == "https" and urlsplit(new).scheme != "https":
+                raise urllib.error.HTTPError(url, r.status, "redirect from https refused", r.headers, None)
+            url = new
+            continue
+        if not 200 <= r.status < 300:
+            raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+        return r, _decode(body, r.headers.get("Content-Encoding"))
+    raise urllib.error.HTTPError(url, r.status, "Too many redirects", r.headers, None)
+
+
+def fetch(url, timeout=10):
+    """GET url and return the body; raises on network errors and non-2xx statuses."""
+    return _open(url, timeout)[1]
+
+
+def fetch_range(url, start, end, timeout=20):
+    """Bytes start to end (inclusive) of what's at url."""
+    body = _open(url, timeout, {"Range": "bytes=%d-%d" % (start, end)})[1]
+    if len(body) > end - start + 1:   # a server that ignores ranges sends it all
+        body = body[start:end + 1]
+    return body
+
+
+def _scrub(data):
+    """Make every string in parsed JSON printable, in place: names, plays and
+    labels all end up on screen, and none of them should move the cursor or
+    retitle the window."""
+    if isinstance(data, dict):
+        items = data.items()
+    elif isinstance(data, list):
+        items = enumerate(data)
+    else:
+        return printable(data) if isinstance(data, str) else data
+    for k, v in items:
+        if isinstance(v, str):
+            if not v.isprintable():
+                data[k] = printable(v)
+        elif isinstance(v, (dict, list)):
+            _scrub(v)
+    return data
+
+
+def fetch_json(url, timeout=10):
+    return _scrub(json.loads(fetch(url, timeout)))
+
+
+def query_url(base, **params):
+    """base with params as its query string."""
+    return base + "?" + urlencode(params)
