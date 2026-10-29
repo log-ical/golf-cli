@@ -110,8 +110,8 @@ class GameTest(unittest.TestCase):
         self.assertAlmostEqual(g.setup.length, 4 + engine.PUTT_PAST, delta=0.01)   # the caddie's: a bit past
         g.help = "yardages"
         g.suggest()
-        self.assertAlmostEqual(g.setup.length, 4, delta=0.01)                      # yours: the distance
-        self.assertAlmostEqual(g.swing(power=0.5).length, 2, delta=0.01)          # on the meter: half of it
+        self.assertAlmostEqual(g.setup.length, 4 + 2 / 3, delta=0.01)              # yours: a bit past, to the foot
+        self.assertAlmostEqual(g.swing(power=0.5).length, 7 / 3, delta=0.01)      # on the meter: half of it
         g.change_length(-100)
         self.assertEqual(g.setup.length, game.LENGTH_MIN)
         land, end, holed = g.preview()
@@ -195,6 +195,17 @@ class ScreenTest(unittest.TestCase):
                 now += 1.0
                 scr.tick(now, 1.0)
         self.assertTrue({"intro", "aim", "flight", "result", "summary"} <= phases)
+
+    def test_a_new_setup_ignores_a_late_skip(self):
+        # Space pressed to skip the pause after a shot, just as the next setup
+        # comes up on its own, mustn't swing.
+        g = a_game()
+        scr = play.Screen(g, Colors("256"))
+        scr.go("aim", 10.0)
+        play.handle(scr, " ", 10.0 + play.SETTLE / 2, None)
+        self.assertEqual((scr.phase, g.ball.strokes), ("aim", 0))
+        play.handle(scr, " ", 10.0 + play.SETTLE + 0.01, None)
+        self.assertEqual(scr.phase, "meter" if play.on_meter(g) else "flight")
 
     def test_the_setup_shows(self):
         g = a_game(help="yardages")

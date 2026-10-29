@@ -125,12 +125,15 @@ def wind_arrow(weather, bearing, way):
     return ARROWS[int((angle + 22.5) // 45) % 8]
 
 
-def weather_text(weather, bearing, way, units):
+def weather_text(weather, bearing, way, units, map_bearing=None):
+    """The wind (as it plays on a shot toward bearing, and its arrow on a map
+    turned to map_bearing, the same if not given), the temperature and sky."""
     if weather.wind_mph < 1:
         wind = "No wind"
     else:
         speed = "%d km/h" % round(weather.wind_mph * 1.609) if units == "meters" else "%d mph" % round(weather.wind_mph)
-        wind = "Wind %s %s %s" % (wind_arrow(weather, bearing, way), speed, wind_words(weather, bearing))
+        arrow = wind_arrow(weather, bearing if map_bearing is None else map_bearing, way)
+        wind = "Wind %s %s %s" % (arrow, speed, wind_words(weather, bearing))
         if weather.gust_mph > weather.wind_mph + 3:
             g = weather.gust_mph * (1.609 if units == "meters" else 1)
             wind += ", gusting %d" % round(g)
@@ -142,11 +145,11 @@ def weather_text(weather, bearing, way, units):
 # --------------------------------------------------------------------------
 # The group and the scorecard
 
-def group_rows(golfers, standing, colors, width, playing=None, two_lines=False):
-    """A row per golfer, best first: place, name, score to par and thru, and
-    where their ball is on this hole (with two_lines, on a row of its own
-    under the name). standing[i] is (to par, holes done, what's happening
-    now) for golfer i."""
+def group_rows(golfers, standing, colors, width, playing=None, two_lines=False, holes=18):
+    """A row per golfer, best first: place, name, score to par and thru (F
+    once all the round's holes are done), and where their ball is on this
+    hole (with two_lines, on a row of its own under the name). standing[i]
+    is (to par, holes done, what's happening now) for golfer i."""
     rows = []
     places = scoring.standings([s[0] for s in standing])
     name_w = max(len(g.short_name) for g in golfers)
@@ -154,7 +157,7 @@ def group_rows(golfers, standing, colors, width, playing=None, two_lines=False):
         g = golfers[i]
         to_par, thru, now = standing[i]
         mark = "▶" if i == playing else " "
-        thru_text = "F" if thru == 18 else "thru %d" % thru if thru else ""
+        thru_text = "F" if thru >= holes else "thru %d" % thru if thru else ""
         head = "%s %-3s " % (mark, place if len(golfers) > 1 else "")
         line = head + rgb_fg(colors, g.ball, "●", True) + " " + BOLD + g.short_name.ljust(name_w) + RESET
         score = scoring.to_par(to_par)
@@ -185,10 +188,10 @@ def scorecard(holes, golfers, cards, current, colors, width, nine=False):
     name_w = min(12, max(len(g.short_name) for g in golfers))
     nines = [list(range(0, min(9, n))), list(range(9, n))] if n > 9 else [list(range(n))]
     nines = [x for x in nines if x]
-    total_w = name_w + 2 + sum(len(x) * 3 + 5 for x in nines) + 5
-    if (nine or total_w > width) and len(nines) > 1:
+    total_w = name_w + 3 + sum(len(x) * 3 + 5 for x in nines) + 5   # "● name " and the nines, then Tot
+    if (nine or total_w + 1 > width) and len(nines) > 1:             # (+1: it's shown a space in)
         nines = [x for x in nines if current in x] or nines[:1]
-    head, par = " " * (name_w + 2), "Par".ljust(name_w + 2)
+    head, par = " " * (name_w + 3), "Par".ljust(name_w + 3)
     rows = [[] for _ in golfers]
     for k, nine in enumerate(nines):
         for j in nine:

@@ -157,8 +157,9 @@ def load_settings():
 
 
 def _set_aside(problems):
-    try:
-        os.replace(CONFIG_PATH, CONFIG_PATH + ".bad")
+    try:   # the file itself, so a settings.json linked from a dotfiles folder stays a link
+        real = os.path.realpath(CONFIG_PATH)
+        os.replace(real, real + ".bad")
     except OSError:
         pass
     return problems
@@ -218,11 +219,12 @@ class OptionsMenu:
 
     def render(self, cols, rows):
         label_w = max(len(o[1]) for o in OPTIONS)
+        val_w = max(len(fmt_value(v)) for _, _, choices in OPTIONS for v in choices) + 4
         head = ["", center(BOLD + "OPTIONS" + RESET, cols), ""]
         options = []
         for i, (k, label, _) in enumerate(OPTIONS):
             val = "‹ %s ›" % fmt_value(settings[k])
-            row = "  %-*s   %-14s" % (label_w, label, val)
+            row = "  %-*s   %-*s" % (label_w, label, val_w, val)
             if i == self.sel:
                 row = REVERSE + BOLD + row + RESET
             options.append(center(row, cols))

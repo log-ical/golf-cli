@@ -139,7 +139,10 @@ def _get(path, query, refresh, keep):
             err = CourseError(remark.strip()[:100])
             continue
         if keep(data):
-            write_atomic(path, raw)
+            try:
+                write_atomic(path, raw)
+            except OSError:   # the cache can't be written (a full disk): it's downloaded again next time
+                pass
         return data
     raise CourseError("couldn't reach OpenStreetMap: %s" % err)
 
@@ -233,9 +236,16 @@ def _kind(tags):
         return "path"
     if tags.get("barrier") == "hedge":
         return "hedge"
-    if tags.get("waterway"):
+    if tags.get("waterway") and tags["waterway"] not in ("dam", "weir", "lock_gate"):   # (those you can walk over)
         return "water"
     return None
+
+
+def _drawn_along(k, tags):
+    """Whether a closed way of kind k is a line drawn round (a road round a
+    block, a ditch round a field, a row of trees round a car park), not an area."""
+    return k in ("path", "road", "hedge") or tags.get("natural") == "tree_row" or \
+        tags.get("waterway") not in (None, "riverbank")
 
 
 def _tree(el, p, tags):
@@ -324,7 +334,7 @@ def parse(data, kind, osm_id, around=None, cover=None, heights=None):
         if not shape:
             continue
         leaf, tone = LEAVES.get(t.get("leaf_type")), el["id"] % 5
-        if shape[0] == "area" and k not in ("path", "road", "hedge"):
+        if shape[0] == "area" and not (el["type"] == "way" and _drawn_along(k, t)):
             features.append(Feature(k, poly=shape[1], leaf=leaf, tone=tone, color=_tee_color(t) if k == "tee" else None))
         else:   # a line, or a road or path mapped as a closed way (drawn along it)
             pts = shape[1] if shape[0] == "line" else shape[1].rings[0] + shape[1].rings[0][:1]

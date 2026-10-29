@@ -43,6 +43,7 @@ PUTT_PACE = 0.07      # a putt's length, a fraction of it, one standard deviatio
 PUTT_PAST = 0.5       # yards past the hole a putt is struck to finish
 TIMING_LINE, TIMING_CURVE = 6.0, 10.0   # degrees a mistimed swing (timing 1) starts off line, and curves
 OVERSWING = 1.1       # the most power a swing has (more than a full swing, less control)
+GUST = 0.5            # the wind as it usually blows: halfway to its gusts (a swing's is drawn from 0 to 1)
 MISSES = ("slice", "hook", "push", "pull", "chunk", "thin", "shank")
 MISS_ODDS = (0.25, 0.15, 0.15, 0.12, 0.15, 0.15, 0.03)
 # How far a landing ball runs on each surface (times the club's roll), and
@@ -202,8 +203,8 @@ class Striker:
     def surface(self, p):
         key = (round(p[0] * 2), round(p[1] * 2))   # to half a yard: the same spots get asked about again
         s = self._surface.get(key)
-        if s is None:
-            s = self._surface[key] = self.course.surface_at(p)
+        if s is None:   # at the half yard's own spot, so the answer can't depend on what was asked first
+            s = self._surface[key] = self.course.surface_at((key[0] / 2, key[1] / 2))
         return s
 
     def carry(self, swing, lie):
@@ -239,11 +240,12 @@ class Striker:
         if swing.kind == "putt":
             end, holed = self.run(ball.pos, swing.bearing, swing.length, "putt", cup, trace)
             return ball.pos, end, holed
-        land, bend = self._flight(ball, swing, 0.0, self.g.shape * (not t.short) + t.curve, 1.0, 0.3)
+        land, bend = self._flight(ball, swing, 0.0, self.g.shape * (not t.short) + t.curve, 1.0, GUST)
         if t.short:
             end, holed = self.run(land, heading(bend, land), self._short_run(swing, land, ball), "short", cup, trace)
         else:
-            roll = swing.club.roll * t.roll * wx.roll_factor(self.weather)
+            lie = clubs.LIES.get(ball.lie, clubs.LIES["rough"])
+            roll = swing.club.roll * t.roll * lie.roll * wx.roll_factor(self.weather)
             end, holed = self.run(land, heading(bend, land), roll, "full", cup, trace)
         return land, end, holed
 
@@ -346,7 +348,7 @@ class Striker:
             else:   # shank
                 start, length = start + rng.uniform(30, 45), length * rng.uniform(0.35, 0.55)
         land, bend = self._flight(ball, swing, start, curve, length, rng.random())
-        roll = swing.club.roll * t.roll * run * wx.roll_factor(self.weather)
+        roll = swing.club.roll * t.roll * run * lie.roll * wx.roll_factor(self.weather)
         end, holed = self.run(land, heading(bend, land), roll, "full")
         kind = kind or ("tee" if ball.lie == "tee" else "punch" if swing.kind == "punch" else "approach")
         return self.finish(ball, kind, swing.club.name, land, end, bend, miss, holed, swing.kind, t.height)
@@ -493,11 +495,13 @@ class Striker:
                 spot = step(spot, b, 2)
             spot = step(spot, b, 2)
             new = self.surface(spot)
-            if new in ("water", "ob", "green"):   # nowhere dry: play again from where it was hit
+            if new in ("water", "ob", "green"):   # nowhere dry: play again from where it was hit (a tee still a tee)
                 spot, new = start, ball.lie
-            out.append(self.drop(ball, end, spot, "fairway" if new == "tee" else new))
-        else:
-            ball.pos, ball.lie = end, lie
+            elif new == "tee":
+                new = "fairway"
+            out.append(self.drop(ball, end, spot, new))
+        else:   # another hole's tee box (or a forward one) is no tee to tee it up on
+            ball.pos, ball.lie = end, "fairway" if lie == "tee" else lie
         return out
 
     def drop(self, ball, at, spot, lie):

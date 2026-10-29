@@ -2,15 +2,21 @@
 and paths.
 
 A course is a few kilometres across at most, so an equirectangular
-projection about its center is accurate to well under a yard. x runs east and
+projection about its center, scaled for the earth's shape at its latitude,
+is accurate to well under a yard. x runs east and
 y north, both in yards.
 """
 
 import math
 
 YARDS_PER_METER = 1.0936133
-METERS_PER_DEG_LAT = 110574.0
-METERS_PER_DEG_LON = 111320.0   # at the equator; times cos(latitude)
+
+
+def meters_per_degree(lat):
+    """(meters per degree of latitude, of longitude) at a latitude, on the WGS 84 ellipsoid."""
+    r = math.radians(lat)
+    return (111132.95 - 559.82 * math.cos(2 * r) + 1.175 * math.cos(4 * r),
+            111412.84 * math.cos(r) - 93.5 * math.cos(3 * r))
 
 
 class Projection:
@@ -18,8 +24,8 @@ class Projection:
 
     def __init__(self, lat0, lon0):
         self.lat0, self.lon0 = lat0, lon0
-        self.kx = METERS_PER_DEG_LON * math.cos(math.radians(lat0)) * YARDS_PER_METER
-        self.ky = METERS_PER_DEG_LAT * YARDS_PER_METER
+        m_lat, m_lon = meters_per_degree(lat0)
+        self.kx, self.ky = m_lon * YARDS_PER_METER, m_lat * YARDS_PER_METER
 
     def __call__(self, lat, lon):
         return ((lon - self.lon0) * self.kx, (lat - self.lat0) * self.ky)

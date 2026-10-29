@@ -28,6 +28,7 @@ SURFACE_OF = {"building": "ob", "flowers": "trees", "heath": "trees", "hedge": "
 DRAWN_ONLY = ("path", "road", "parking", "lawn", "pool")   # kinds that don't change how a ball plays
 TREE_RADIUS = 4.0      # yards of canopy round a mapped single tree, unless it says
 CELL = 40.0            # yards per side of the lookup grid's cells
+REACH = 500.0          # yards round the holes and the boundary the grid covers (a lake's far shore can be miles off)
 PIN_SLOPE = 0.03       # rise a yard: a pin on a steeper slope than this is moved
 PIN_EDGE = 4.0         # yards in from the green's edge a moved pin is, at least
 PIN_STRAY = 0.002      # what each yard from where the map put it costs a spot, in slope
@@ -145,13 +146,16 @@ class Course:
         self._tree_grid = {}     # (i, j) -> [Tree] whose canopy reaches into that cell
         self._sides = {}         # (i, j) -> True all inside the boundary, False all outside, None both
         rank = {k: i for i, k in enumerate(PRIORITY)}
+        pts = [p for h in holes for p in h.path] + [p for r in (boundary.rings if boundary else ()) for p in r]
+        x0, y0, x1, y1 = bbox(pts) if pts else (0, 0, 0, 0)
+        reach = (x0 - REACH, y0 - REACH, x1 + REACH, y1 + REACH)
         # Lines (a creek, a row of trees) are looked up a segment at a time,
         # so a long one sits only in the cells it runs through.
         pieces = [g for f in features if f.surface in rank
                   for g in ([f] if f.poly is not None else
                             [Feature(f.kind, line=[a, b], width=f.width) for a, b in zip(f.line, f.line[1:])])]
         for f in sorted(pieces, key=lambda f: rank[f.surface]):
-            for key in _cells(f.box):
+            for key in _cells(_clip(f.box, reach)):
                 self._grid.setdefault(key, []).append(f)
         for t in self.trees:
             for key in _cells((t.x - t.r, t.y - t.r, t.x + t.r, t.y + t.r)):
@@ -237,13 +241,23 @@ class Course:
             i, j = key
             corners = [self.boundary.contains(x, y) for x in (i * CELL, (i + 1) * CELL)
                        for y in (j * CELL, (j + 1) * CELL)]
-            crossed = any(i * CELL <= x <= (i + 1) * CELL and j * CELL <= y <= (j + 1) * CELL
-                          for ring in self.boundary.rings for x, y in ring)
+            cx0, cy0, cx1, cy1 = i * CELL, j * CELL, (i + 1) * CELL, (j + 1) * CELL
+            crossed = any(min(a[0], b[0]) <= cx1 and max(a[0], b[0]) >= cx0 and   # an edge near it, at least
+                          min(a[1], b[1]) <= cy1 and max(a[1], b[1]) >= cy0
+                          for ring in self.boundary.rings for a, b in zip(ring, ring[1:] + ring[:1]))
             side = self._sides[key] = corners[0] if len(set(corners)) == 1 and not crossed else None
         return side if side is not None else self.boundary.contains(*p)
 
 
+def _clip(box, to):
+    """box cut to the box `to` (empty if they don't meet)."""
+    x0, y0, x1, y1 = max(box[0], to[0]), max(box[1], to[1]), min(box[2], to[2]), min(box[3], to[3])
+    return (x0, y0, x1, y1) if x0 <= x1 and y0 <= y1 else None
+
+
 def _cells(box):
+    if box is None:
+        return
     x0, y0, x1, y1 = box
     for i in range(int(x0 // CELL), int(x1 // CELL) + 1):
         for j in range(int(y0 // CELL), int(y1 // CELL) + 1):

@@ -79,7 +79,7 @@ class Colors:
     """Color escapes for the current mode ("truecolor", "256" or "16").
 
     The mode can be changed at any time (the options menu does). Escapes
-    are memoized per mode, since logos ask for the same colors again and again.
+    are memoized per mode, since the maps ask for the same colors again and again.
     """
 
     def __init__(self, mode):
@@ -133,7 +133,7 @@ _UNPRINTABLE = re.compile("[\x00-\x1a\x1c-\x1f\x7f-\x9f\ud800-\udfff]")
 
 def printable(s):
     """s made safe to put on screen. Line breaks, tabs and odd spaces become
-    one space (ESPN writes some plays as "bad pass\\nturnover"); control and
+    one space (a name in OpenStreetMap can have a line break in it); control and
     format characters are dropped: the ESC of an escape sequence, bidi
     overrides, and lone surrogates (from a "\\ud800" in JSON)."""
     if s.isprintable():
@@ -142,27 +142,54 @@ def printable(s):
     return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
 
 
+def char_width(ch):
+    """Columns a character takes: two for East Asian wide ones (a course
+    named in Japanese), none for combining marks."""
+    if ch.isascii():
+        return 1
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(s):
+    """Columns plain text takes on screen."""
+    return len(s) if s.isascii() else sum(map(char_width, s))
+
+
+def cut_to(s, width):
+    """The start of plain text s that fits in width columns."""
+    if s.isascii():
+        return s[:width]
+    used = 0
+    for i, ch in enumerate(s):
+        used += char_width(ch)
+        if used > width:
+            return s[:i]
+    return s
+
+
 def visible_len(s):
     if "\x1b" not in s:
-        return len(s)
+        return text_width(s)
     return _styled_len(s)
 
 
 @functools.lru_cache(maxsize=1024)
 def _styled_len(s):
-    # Cached because every frame measures the same styled lines (logo rows
+    # Cached because every frame measures the same styled lines (the title's
     # most of all) again, as new but equal strings.
-    return len(_SGR.sub("", s))
+    return text_width(_SGR.sub("", s))
 
 
 def shorten(text, width):
     """Plain text in at most width columns: cut between words, with "…"."""
-    if len(text) <= width:
+    if text_width(text) <= width:
         return text
     if width < 2:
         return "…"[:width]
-    cut = text[:width - 1]
-    if cut[-1] != " " and text[width - 1] != " " and " " in cut:   # mid-word: back to its start
+    cut = cut_to(text, width - 1)
+    if cut and cut[-1] != " " and text[len(cut)] != " " and " " in cut:   # mid-word: back to its start
         cut = cut[:cut.rfind(" ")]
     return cut.rstrip(" ·,") + "…"
 
@@ -247,8 +274,8 @@ def clip(line, cols):
         if i % 2:
             out.append(part)   # an escape
         else:
-            out.append(part[:room])
-            room -= len(out[-1])
+            out.append(cut_to(part, room))
+            room -= text_width(out[-1])
             if room <= 0:
                 break
     return "".join(out)
@@ -412,6 +439,11 @@ class Terminal:
             return self._escape()
         if ch in (b"\r", b"\n"):
             return "enter"
+        if ch[0] >= 0xC0:   # the first byte of a character in UTF-8 (ü, é, 日): read the rest of it
+            for _ in range(1 if ch[0] < 0xE0 else 2 if ch[0] < 0xF0 else 3):
+                if not select.select([self.fd], [], [], ESC_WAIT)[0]:
+                    break
+                ch += os.read(self.fd, 1)
         return ch.decode(errors="ignore")
 
     def _escape(self):
@@ -434,7 +466,9 @@ class Terminal:
             return _CSI_KEYS.get(seq[-1:])
         if intro == b"O":   # SS3: one more byte
             return _SS3_KEYS.get(os.read(self.fd, 1)) if more() else None
-        return "esc" if intro == b"\x1b" else None   # Esc twice, or Alt and a key
+        if intro == b"\x1b":   # Esc twice, or Alt and a key's sequence (rxvt), read to its end too
+            return self._escape() if more() else "esc"
+        return None   # Alt and a key
 
     def draw(self, lines):
         """Show lines[i] on row i, blanking the rows past the end.

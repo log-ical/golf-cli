@@ -10,9 +10,11 @@ Golf in the terminal on real courses, drawn from OpenStreetMap. Two ways to play
 Either way, the ball flies down the fairway (drawn above its shadow) on a camera that follows it, closes in
 on the green for the putts, and a scorecard fills in underneath. Python 3.10 or newer, standard library only.
 
-| Augusta's 2nd: drives following the dogleg | Close up on the green for the putts |
+| Single player: the caddie's play on Pebble Beach's 7th | Close on the cup for a short putt |
 |---|---|
-| ![Two drives on Augusta's 2nd](images/augusta-drives.png) | ![Putts on Augusta's 1st green](images/green-close-up.png) |
+| ![Aiming a wedge at Pebble Beach's 7th, with the swing meter](images/single-player.png) | ![A 9-foot putt on Augusta's 1st, with the green's contours](images/putting.png) |
+| **Zen: three drives down Augusta's 2nd** | **The green camera for the putts** |
+| ![Three drives on Augusta's 2nd](images/augusta-drives.png) | ![Putts on Augusta's 1st green](images/green-close-up.png) |
 | **Weekend golfers meet Sawgrass's island 17th** | **The course list** |
 | ![The island green at TPC Sawgrass](images/sawgrass-17.png) | ![The course list](images/course-list.png) |
 
@@ -68,12 +70,13 @@ How much the game helps is the **Help** setting (on the round's setup):
 | Help | Each shot starts | The map shows | Caddie |
 |------|------------------|---------------|--------|
 | caddie | set up the caddie's way | where it lands and stops, in the wind, with the roll ("stops 9 ft from the flag · green") | its play shown |
-| yardages | at the flag, with the club that carries the distance in still air | where that swing comes down in still air: the wind, the bounce, the roll and the trouble are yours to judge | `r` asks |
+| yardages | at the flag, with the club that carries the distance in still air (a putt: to finish a foot or two past) | where that swing comes down in still air: the wind, the bounce, the roll and the trouble are yours to judge | `r` asks |
 | none | at the flag, with the club you hit last | just your line | none |
 
 The shot line always says what the club carries ("7-iron (178 yds carry)"); the wind is at the top. On a long
 hole `v` moves the camera from the whole hole to the target, or to just ahead of the ball; around the green
-it's close up.
+it's close up, and for a putt of 12 feet or less closer still, on the cup, where the line and the green's
+contours (2 inches apart there) are big enough to read.
 
 Then swing. With **the swing meter**, `space` starts the backswing, `space` again sets the power where the
 meter has got to (▼ marks the power you set up; past 100% is an overswing: more distance, less control),
@@ -121,7 +124,8 @@ Then the **broadcast camera** takes over, from straight overhead:
   higher it flies, and leaves a trail.
 - **Where it stops** the camera settles, with the yardage that's left.
 - **Around the green** chips and putts get the green camera, roomy enough for the whole putt, panning
-  between the ball and the hole and labelling every ball with how far it is from the cup.
+  between the ball and the hole and labelling every ball with how far it is from the cup; a putt from 12
+  feet or less, the camera on the cup.
 - **The summary** goes back to the whole hole, with the scores on it.
 
 `c` switches to the **whole-hole camera**: the hole always in view, with the close-up on the green for the
@@ -303,5 +307,12 @@ a warning, rather than saved over.
       term.py net.py        terminal I/O and colors; HTTP (from scoreboard-cli)
       settings.py files.py  settings file and options menu; where things are kept on disk
     tests/                  unittest suite on a small made-up course; no network
+    tools/
+      screenshots.py        the README's screenshots, made again from the app's own screens
+      ansi2png.py           a frame of the app as a PNG, as a terminal shows it
 
 Run the tests with `python3 -m unittest discover -s tests -t .` from the top of the repo.
+
+The screenshots in `images/` come from `python3 tools/screenshots.py` (or `... putting` for one of
+them), which plays fixed-seed scenes on the cached courses and draws them on a 120 by 40 terminal. It
+needs [Pillow](https://pypi.org/project/pillow/); the app itself doesn't.

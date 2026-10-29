@@ -17,10 +17,10 @@ from . import engine, panels
 from .engine import OVERSWING
 from .geo import dist, heading, lerp, step
 from .scoring import name as score_name, to_par
-from .screens import (BOX_BG, BOX_FG, CLOSE_RANGE, FRAME, HEIGHT, LIFT_MAX, MIN_MAP, TRAIL, TRAIL_NOW, Scene,
+from .screens import (BOX_BG, BOX_FG, CLOSE_RANGE, CUP_RANGE, FRAME, HEIGHT, LIFT_MAX, MIN_MAP, TRAIL, TRAIL_NOW, Scene,
                       Views, ball_at, direct, flight_time, height_at, high_detail, pause_time, roll_time, trail,
                       with_footer)
-from .render import FLAG
+from .render import CLOSE_LEVELS, FLAG
 from .settings import PACES, save_settings, settings
 from .term import BOLD, DIM, RESET, center, shorten
 
@@ -30,6 +30,7 @@ FOOT = 1 / 3                  # yards
 RISE_SHOWN = FOOT             # how far the hole must be above or below the ball for the setup to say so
 AIM_COLOR = (255, 236, 120)
 INTRO, SUMMARY = 2.4, 8.0     # seconds (the summary: unless a key moves on sooner)
+SETTLE = 0.6                  # seconds a new shot's setup ignores space: a press meant to skip what came before
 INFO_ROWS = 5                 # under the map: the ball, the setup, where it'd go, the swing, a gap
 # The swing meter, in the units of power: up from 0 at RISE a second, to
 # OVERSWING at most; then down through the strike at 0 (a perfect one), at
@@ -174,7 +175,9 @@ def setup_lines(game, land, end, holed, units, width):
             where, engine.club(cad.club).name, "" if cad.kind in ("full", "putt") else
             ", " + engine.BY_TYPE[cad.kind].name.lower())
     elif s.club == "P":
-        note = "Rolls %s on the flat; the green, and your stroke, do the rest" % panels.feet(s.length, units)
+        past = s.length - game.to_pin
+        note = "Rolls %s on the flat (%s %s the hole); the green, and your stroke, do the rest" % (
+            panels.feet(s.length, units), panels.feet(abs(past), units), "past" if past >= 0 else "short of")
     else:
         note = "This swing carries %s in still air: the wind, the bounce and the roll are yours to judge" % (
             panels.yards(game.carry(), units))
@@ -296,9 +299,15 @@ class Screen:
         whole = views.get(course, g.hole, cols, rows, aspect, "hole", quad, wait=True)
         m, target = whole, None
         if settings["green_view"] and g.to_pin <= CLOSE_RANGE:
-            green = views.get(course, g.hole, cols, rows, aspect, "green", quad)
-            if green is not None and green.covers(g.ball.pos) and green.covers(end):
-                m, target = green, lerp(g.ball.pos, lerp(end, g.hole.pin, 0.5), 0.5)
+            close = [views.get(course, g.hole, cols, rows, aspect, "green", quad)]
+            if g.setup.club == "P" or g.ball.lie == "green":   # (the cup's made ahead once on the green)
+                cup = views.get(course, g.hole, cols, rows, aspect, "cup", quad)
+                if g.setup.club == "P" and g.to_pin <= CUP_RANGE:
+                    close.insert(0, cup)
+            for near in close:
+                if near is not None and near.covers(g.ball.pos) and near.covers(end):
+                    m, target = near, lerp(g.ball.pos, lerp(end, g.hole.pin, 0.5), 0.5)
+                    break
         if m is whole and self.look != "hole":
             fairway = views.get(course, g.hole, cols, rows, aspect, "fairway", quad)
             if fairway is not None:
@@ -353,7 +362,7 @@ def frame(term, scr, now, dt):
         more_tints, more_marks = aim_marks(g, m, land, end, holed)
         tints += more_tints
         marks += more_marks
-        if m.level == "green" and not holed and g.help == "caddie":
+        if m.level in CLOSE_LEVELS and not holed and g.help == "caddie":
             labels.append((end, panels.left(dist(end, hole.pin), "green", units), AIM_COLOR))
     marks.append((hole.pin, "▶", FLAG, True))   # over the aiming cross
     if scr.phase == "flight":
@@ -385,7 +394,7 @@ def frame(term, scr, now, dt):
     if top:
         _, _, diff = g.totals()
         title = "%s  ·  %s  ·  you %s" % (g.course.name, panels.hole_title(g.course, hole, units), to_par(diff))
-        weather = panels.weather_text(g.weather, heading(g.ball.pos, hole.pin), m.way, units)
+        weather = panels.weather_text(g.weather, heading(g.ball.pos, hole.pin), m.way, units, m.frame.bearing)
         lines += [center(BOLD + shorten(title, cols) + RESET, cols), center(DIM + shorten(weather, cols) + RESET, cols)]
     lines += map_lines
     width = cols - 2
@@ -473,7 +482,9 @@ def handle(scr, key, now, menu):
         elif key == "v":
             scr.look = {"hole": "target", "target": "ball", "ball": "hole"}[scr.look]
         elif key in (" ", "enter"):
-            if not on_meter(g):
+            if now - scr.at < SETTLE:
+                pass   # it's only just come up (on its own, perhaps as space was pressed to skip the pause)
+            elif not on_meter(g):
                 scr.strike(now)
             else:
                 scr.meter = Meter(now, settings["meter"])
@@ -498,30 +509,33 @@ def play_round(term, game, colors, menu):
     """Play a round. Returns "again" (a new round), "back" or "quit"."""
     scr = Screen(game, colors)
     last = time.monotonic()
-    while True:
-        now = time.monotonic()
-        dt, last = min(0.5, now - last), now
-        if menu.open:
-            cols, rows = term.size()
-            term.draw(menu.render(cols, rows))
-            key = term.read_key(0.25)
+    try:
+        while True:
+            now = time.monotonic()
+            dt, last = min(0.5, now - last), now
+            if menu.open:
+                cols, rows = term.size()
+                term.draw(menu.render(cols, rows))
+                key = term.read_key(0.25)
+                if key == "\x0c":
+                    term.invalidate()
+                elif key:
+                    menu.handle_key(key)
+                scr.at += time.monotonic() - now   # the menu stops the round's clock
+                if scr.meter:
+                    scr.meter = None
+                    scr.go("aim", scr.at)
+                last = time.monotonic()
+                continue
+            scr.tick(now, PACES.get(settings["pace"], 1.0))
+            term.draw(frame(term, scr, now, dt))
+            busy = scr.phase in ("flight", "meter") or scr.ui.get("shot") == "aim"
+            key = term.read_key(FRAME if busy else 0.1)
             if key == "\x0c":
                 term.invalidate()
-            elif key:
-                menu.handle_key(key)
-            scr.at += time.monotonic() - now   # the menu stops the round's clock
-            if scr.meter:
-                scr.meter = None
-                scr.go("aim", scr.at)
-            last = time.monotonic()
-            continue
-        scr.tick(now, PACES.get(settings["pace"], 1.0))
-        term.draw(frame(term, scr, now, dt))
-        busy = scr.phase in ("flight", "meter") or scr.ui.get("shot") == "aim"
-        key = term.read_key(FRAME if busy else 0.1)
-        if key == "\x0c":
-            term.invalidate()
-        elif key is not None:
-            out = handle(scr, key, time.monotonic(), menu)
-            if out:
-                return out
+            elif key is not None:
+                out = handle(scr, key, time.monotonic(), menu)
+                if out:
+                    return out
+    finally:
+        scr.views.close()   # its worker, and the maps

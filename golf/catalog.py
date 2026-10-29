@@ -19,6 +19,7 @@ NOMINATIM = "https://nominatim.openstreetmap.org/search"
 INDEX = os.path.join(COURSE_DIR, "index.json")
 SEARCH_GAP = 1.1   # seconds between searches: Nominatim allows one a second
 OVERPASS = SERVERS[0]
+AROUND_MOST = 40   # courses listed round a place, the biggest
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,7 +93,7 @@ def around(box, label):
     half_lat = min(0.36, max(0.045, (n - s) / 2))
     half_lon = min(0.5, max(0.06, (e - w) / 2))
     q = ('[out:json][timeout:30];(way["leisure"="golf_course"]["name"](%f,%f,%f,%f);'
-         'relation["leisure"="golf_course"]["name"](%f,%f,%f,%f););out tags bb 40;') % (
+         'relation["leisure"="golf_course"]["name"](%f,%f,%f,%f););out tags bb;') % (
         (lat - half_lat, lon - half_lon, lat + half_lat, lon + half_lon) * 2)
     data = fetch_json(query_url(OVERPASS, data=q), timeout=40)
     found = []
@@ -101,7 +102,7 @@ def around(box, label):
         size = abs((b.get("maxlat", 0) - b.get("minlat", 0)) * (b.get("maxlon", 0) - b.get("minlon", 0)))
         town = tags.get("addr:city") or label
         found.append((size, Entry(tags["name"], town, el["type"], int(el["id"]))))
-    return [e for _, e in sorted(found, key=lambda x: -x[0])]
+    return [e for _, e in sorted(found, key=lambda x: -x[0])][:AROUND_MOST]
 
 
 def _search(q):

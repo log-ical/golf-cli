@@ -26,7 +26,7 @@ import random
 
 from . import clubs
 from . import weather as wx
-from .engine import BY_TYPE, MAX_STROKES, PUTT_PAST, PUTTER, SCATTER, Ball, Shot, Striker, Swing  # noqa: F401
+from .engine import BY_TYPE, GUST, MAX_STROKES, PUTT_PAST, PUTTER, SCATTER, Ball, Shot, Striker, Swing  # noqa: F401
 from .geo import ahead_on_path, dist, heading, lerp, step
 
 SHORT_GAME = 45       # yards from the hole inside which it's a chip or a pitch, not a full swing
@@ -86,7 +86,7 @@ class Player(Striker):
         """Strokes to come from where a shot finished (its penalties included)."""
         s = self.surface(p)
         if s == "ob":   # stroke and distance: the penalty, and this shot again
-            return 2 + expected(ball.lie, dist(ball.pos, self.hole.pin))
+            return 1 + expected(ball.lie, dist(ball.pos, self.hole.pin))
         return expected(s, dist(p, self.hole.pin))
 
     # ----------------------------------------------------------------------
@@ -136,7 +136,7 @@ class Player(Striker):
     def cost(self, plan, ball):
         kind, club, aim = plan
         b = heading(ball.pos, aim)
-        tail, _ = self.weather.wind_on(b, 0.3)
+        tail, _ = self.weather.wind_on(b, GUST)
         club, fly = self.club_and_carry(kind, club, aim, ball, tail)
         fly = fly * wx.carry_factor(self.weather, tail) - self.rise(ball.pos, aim)
         lie = clubs.LIES.get(ball.lie, clubs.LIES["rough"])
@@ -161,7 +161,7 @@ class Player(Striker):
         kind, club, aim = min(self.plans(ball), key=lambda p: self.cost(p, ball))
         b = heading(pos, aim)
         # Played for the wind they feel: clubbed up or down, aimed off.
-        tail, cross = self.weather.wind_on(b, 0.3)
+        tail, cross = self.weather.wind_on(b, GUST)
         club, fly = self.club_and_carry(kind, club, aim, ball, tail)
         expect = fly * wx.carry_factor(self.weather, tail) - self.rise(pos, aim)
         line = b - math.degrees(math.atan2(wx.drift(cross, expect), max(expect, 1)))

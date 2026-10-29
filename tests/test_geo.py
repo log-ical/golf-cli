@@ -12,8 +12,10 @@ class ProjectionTest(unittest.TestCase):
         lat, lon = proj.back(x, y)
         self.assertAlmostEqual(lat, 56.35, places=9)
         self.assertAlmostEqual(lon, -2.79, places=9)
-        # A hundredth of a degree of latitude is about 1,209 yards anywhere.
-        self.assertAlmostEqual(proj(56.35, -2.8)[1], 1209, delta=3)
+        # A hundredth of a degree of latitude is 1,218 yards at St Andrews (1,209 at the equator),
+        # and of longitude 676 (cos(56.34°) of the equator's 1,218).
+        self.assertAlmostEqual(proj(56.35, -2.8)[1], 1218, delta=1)
+        self.assertAlmostEqual(proj(56.34, -2.79)[0], 676, delta=1)
 
 
 class PathTest(unittest.TestCase):

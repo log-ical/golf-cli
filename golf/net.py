@@ -131,6 +131,8 @@ def _read(r):
     body = r.read(MAX_BODY + 1)
     if len(body) > MAX_BODY:
         raise ValueError("response too large")
+    if r.length:   # the connection closed before all the Content-Length said was coming
+        raise http.client.IncompleteRead(body, r.length)
     return body
 
 

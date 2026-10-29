@@ -98,12 +98,13 @@ class Game:
     def plain(self):
         """A shot set up with no thought for the wind, the roll or the trouble:
         at the flag; with "yardages" the club that carries the distance in
-        still air (a pitch inside SHORT yards), with "none" the club hit last."""
+        still air (a pitch inside SHORT yards), with "none" the club hit last. A
+        putt is set to roll a little past the hole, to the foot, as a putt to drop should."""
         ball, d = self.ball, self.to_pin
         b = heading(ball.pos, self.hole.pin)
         keys = self.clubs()
         if ball.lie == "green" or (keys[-1] == "P" and d <= 10 and ball.lie != "rough"):
-            return Setup("P", "putt", b, 1.0, round(d * 3) / 3 or LENGTH_MIN)
+            return Setup("P", "putt", b, 1.0, max(LENGTH_MIN, round((d + engine.PUTT_PAST) * 3) / 3))
         keys = [k for k in keys if k != "P"]
         if self.help == "none" and self.last_club in keys:
             key = self.last_club
@@ -152,7 +153,10 @@ class Game:
         shot stays if the new club can play it."""
         keys = self.clubs()
         i = keys.index(self.setup.club) if self.setup.club in keys else 0
-        self.setup.club = keys[(i + step) % len(keys)]
+        if self.setup.club == "P" and step > 0 and len(keys) > 1:
+            self.setup.club = keys[-2]   # off the putter (c): the shortest club, for a chip, not the driver
+        else:
+            self.setup.club = keys[(i + step) % len(keys)]
         kinds = self.kinds()
         if self.setup.kind not in kinds:
             self.setup.kind = kinds[0]

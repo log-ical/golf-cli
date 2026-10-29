@@ -15,6 +15,7 @@ ETOPO1 and others (github.com/tilezen/joerd/blob/master/docs/attribution.md).
 
 import array
 import base64
+import http.client
 import itertools
 import json
 import math
@@ -25,6 +26,9 @@ import zlib
 from .files import write_atomic
 from .geo import YARDS_PER_METER, segment_distance
 from .net import fetch
+
+# What a download can fail with: no answer, a cut-off or garbled one, or not the data asked for.
+FAILURES = (OSError, ValueError, KeyError, struct.error, http.client.HTTPException, zlib.error)
 
 USGS = ("https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
         "?bbox={},{},{},{}&bboxSR=3857&imageSR=3857&size={},{}&format=tiff&pixelType=F32&f=image")
@@ -76,25 +80,32 @@ class Heights:
         return _bilinear(self.z, self.w, self.h, (x - self.left) / self.cell - 0.5, (self.top - y) / self.cell - 0.5)
 
     def to_json(self):
-        """Centimeters, each as the step from the one before it in its row
-        (so the gentle ground compresses well)."""
-        base = min(self.z)
+        """Centimeters above the lowest, each as the step from the one before
+        it in its row, and a row's first from the first of the row above (so
+        the gentle ground compresses well), however high the hills go."""
+        base, w = min(self.z), self.w
         cms = [int(round((v - base) * 100)) for v in self.z]
-        steps = [(cms[k] - (cms[k - 1] if k % self.w else 0)) & 0xFFFF for k in range(len(cms))]
-        data = struct.pack("<%dH" % len(steps), *steps)
-        return {"left": self.left, "top": self.top, "cell": self.cell, "w": self.w, "h": self.h, "base": base,
+        steps = [cms[k] - (cms[k - 1] if k % w else cms[k - w] if k else 0) for k in range(len(cms))]
+        data = struct.pack("<%di" % len(steps), *steps)
+        return {"v": 2, "left": self.left, "top": self.top, "cell": self.cell, "w": w, "h": self.h, "base": base,
                 "source": self.source, "cm": base64.b64encode(zlib.compress(data, 6)).decode()}
 
     @classmethod
     def from_json(cls, d):
         w, h, base = int(d["w"]), int(d["h"]), float(d["base"])
-        raw = zlib.decompress(base64.b64decode(d["cm"]))
-        if len(raw) != 2 * w * h:
+        raw, v2 = zlib.decompress(base64.b64decode(d["cm"])), d.get("v") == 2
+        if len(raw) != (4 if v2 else 2) * w * h:
             raise ValueError("heights don't fill the window")
-        steps = struct.unpack("<%dH" % (w * h), raw)
         z = array.array("f")
-        for i in range(h):
-            z.extend(base + (cm & 0xFFFF) / 100 for cm in itertools.accumulate(steps[i * w:(i + 1) * w]))
+        if v2:
+            steps, first = struct.unpack("<%di" % (w * h), raw), 0
+            for i in range(h):
+                first += steps[i * w]
+                z.extend(base + cm / 100 for cm in itertools.accumulate(steps[i * w + 1:(i + 1) * w], initial=first))
+        else:   # the first cache: each row from 0, in steps wrapped to 16 bits
+            steps = struct.unpack("<%dH" % (w * h), raw)
+            for i in range(h):
+                z.extend(base + (cm & 0xFFFF) / 100 for cm in itertools.accumulate(steps[i * w:(i + 1) * w]))
         return cls(float(d["left"]), float(d["top"]), float(d["cell"]), w, h, z, str(d.get("source", "")))
 
 
@@ -193,11 +204,14 @@ def _tiff_floats(b):
     w, h = tags[256][0], tags[257][0]
     if tags.get(259, (1,))[0] != 1 or tags.get(258, (0,))[0] != 32 or tags.get(339, (0,))[0] != 3:
         raise ValueError("not uncompressed 32-bit floats")
-    z = array.array("f", bytes(4 * w * h))
+    z = array.array("f", [math.nan]) * (w * h)   # a tile or strip left out (no data there) stays a gap
     if 322 in tags:
         tw, th = tags[322][0], tags[323][0]
         across = math.ceil(w / tw)
-        for t, o in enumerate(tags[324]):
+        sizes = tags.get(325, (1,) * len(tags[324]))
+        for t, (o, size) in enumerate(zip(tags[324], sizes)):
+            if not size:
+                continue
             ty, tx = divmod(t, across)
             block = struct.unpack_from("<%df" % (tw * th), b, o)
             for i in range(th):
@@ -208,7 +222,10 @@ def _tiff_floats(b):
                 z[y * w + tx * tw:y * w + tx * tw + n] = array.array("f", block[i * tw:i * tw + n])
     else:
         rows = tags.get(278, (h,))[0]
-        for s, o in enumerate(tags[273]):
+        sizes = tags.get(279, (1,) * len(tags[273]))
+        for s, (o, size) in enumerate(zip(tags[273], sizes)):
+            if not size:
+                continue
             n = min(rows, h - s * rows) * w
             z[s * rows * w:s * rows * w + n] = array.array("f", struct.unpack_from("<%df" % n, b, o))
     return w, h, z
@@ -229,7 +246,7 @@ def _usgs(x0, y0, x1, y1):
                 try:
                     gw, gh, got = _tiff_floats(fetch(url, timeout=90))
                     break
-                except (OSError, ValueError, KeyError, struct.error):
+                except FAILURES:
                     if k == TRIES - 1:
                         raise
                     time.sleep(3 * (k + 1))
@@ -352,7 +369,7 @@ def download(bounds):
             got = _usgs(x0, y0, x1, y1)
             if got is not None:
                 return got, True
-        except (OSError, ValueError, KeyError, struct.error):
+        except FAILURES:
             keep = False
     return _tiles(x0, y0, x1, y1), keep
 

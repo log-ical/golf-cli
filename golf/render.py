@@ -18,11 +18,12 @@ shadows, and a soft texture in the rough, the woods and the water.
 Where the course's heights are known, its slopes are shaded too (relief):
 in a few hard steps, so the hills and banks show without blurring the pixels,
 lit from the top left like the shadows; and on a close-up of a green, the
-putting surface gets contour lines, CONTOUR apart, to read the break by.
+putting surface gets contour lines, CONTOUR apart (CUP_CONTOUR on the cup's),
+to read the break by.
 
 Closer views are drawn bigger than the screen, so a camera can follow the ball
 about them (aim()): the fairway camera's covers the whole hole, the green's
-the green and round it. Each frame only redraws the rows with something on
+the green and round it, the cup's a few yards round the hole (short putts). Each frame only redraws the rows with something on
 them, or that the camera has moved.
 """
 
@@ -78,7 +79,9 @@ MARGIN_LONG = 25.0   # beyond the green
 FAIRWAY_ZOOM = 2.5   # how much closer the fairway camera is than the whole hole
 CLOSE_SPAN = 34.0    # yards a close-up shows across the screen's shorter side
 CLOSE_WORLD = 1.7    # how much bigger than the screen a close-up is drawn, for the camera to move about in
+CUP_SPAN = 7.0       # yards the cup's close-up shows across the screen's shorter side
 CONTOUR = 0.11       # yards (4 inches) of height between a green's contour lines
+CUP_CONTOUR = 0.056  # and (2 inches) on the cup's close-up, where a short putt's break is a matter of inches
 CONTOUR_SHADE = 0.9  # how dark they are
 SLOPE_SPAN = (1.2, 3.0)   # yards either side a slope is measured over: close up, and farther off
 SLOPE_GAIN = (2.5, 2.0)   # and how much it's made of, to show
@@ -93,6 +96,8 @@ QUADS = {8: "▘", 4: "▝", 2: "▖", 1: "▗", 12: "▀", 3: "▄", 10: "▌",
          13: "▜", 11: "▙", 7: "▟", 15: "█"}
 SPLITS = tuple((m, [i for i in range(4) if m >> (3 - i) & 1], [i for i in range(4) if not m >> (3 - i) & 1])
                for m in (8, 9, 10, 11, 12, 13, 14))   # each way to split a cell in two, once
+
+CLOSE_LEVELS = ("green", "cup")   # the close-ups: labelled balls, contour lines
 
 _cache = {}          # terrain per view, see HoleMap.terrain
 _CACHE_MAX = 8
@@ -110,7 +115,8 @@ class HoleMap:
     def __init__(self, course, hole, cols, rows, aspect=1.0, way="auto", level="hole", quad=True, relief="on"):
         """level: "hole", the whole hole on screen; "fairway", closer, drawn
         the whole hole's size for the camera to follow the ball down it; or
-        "green", a close-up of the green, drawn a little bigger than the screen.
+        "green", a close-up of the green, drawn a little bigger than the screen;
+        or "cup", closer still round the hole, for short putts.
         relief: "on", the slopes shaded and the greens' contours drawn;
         "greens only", just the contours; "off", neither."""
         self.course, self.hole, self.level, self.relief = course, hole, level, relief
@@ -121,11 +127,11 @@ class HoleMap:
         self.frame = Frame(hole.tee, heading(hole.tee, hole.pin))
         g = hole.green.box
         green = [(g[0], g[1]), (g[0], g[3]), (g[2], g[1]), (g[2], g[3]), hole.pin]
-        if level == "green":
+        if level in CLOSE_LEVELS:
             self.way = way if way in ("across", "up") else "across"
-            self.k = CLOSE_SPAN / min(pa * vw, vh)
+            self.k = (CLOSE_SPAN if level == "green" else CUP_SPAN) / min(pa * vw, vh)
             self.wc, self.wr = math.ceil(self.cols * CLOSE_WORLD), math.ceil(self.rows * CLOSE_WORLD)
-            a0, c0, a1, c1 = bbox([self.frame.to_frame(p) for p in green])
+            a0, c0, a1, c1 = bbox([self.frame.to_frame(p) for p in (green if level == "green" else [hole.pin])])
         else:
             a0, c0, a1, c1 = bbox([self.frame.to_frame(p) for p in list(hole.path) + green])
             a0, a1 = a0 - MARGIN_BACK, a1 + MARGIN_LONG
@@ -204,13 +210,15 @@ class HoleMap:
         key = (id(self.course), id(self.hole), self.wc, self.wr, self.px, self.way, round(self.k, 6),
                round(self.kx, 6), self.level, id(palette), self.relief)
         hit = _cache.get(key)
-        if hit is not None:
-            return hit
+        # The ids are only good while the course and hole are alive: a new one can be given an old one's.
+        if hit is not None and hit[0] is self.course and hit[1] is self.hole:
+            return hit[2]
         pixels = self._paint(self._kinds(), palette)
         made = (pixels, [[self._cell(pixels, x, y) for x in range(self.wc)] for y in range(self.wr)])
+        _cache.pop(key, None)
         if len(_cache) >= _CACHE_MAX:
             _cache.pop(next(iter(_cache)))
-        _cache[key] = made
+        _cache[key] = (self.course, self.hole, made)
         return made
 
     def prepare(self, colors):
@@ -511,7 +519,8 @@ class HoleMap:
         if ground is None or self.relief not in ("on", "greens only"):
             return None
         w, h = self.w, self.h
-        close = self.level == "green"
+        close = self.level in CLOSE_LEVELS
+        apart = CUP_CONTOUR if self.level == "cup" else CONTOUR
         if self.relief == "greens only" and not close:
             return None
         zs = [ground.z(self.to_course(x + 0.5, y + 0.5)) for y in range(h) for x in range(w)]
@@ -521,9 +530,9 @@ class HoleMap:
         low, high = SLOPE_STEPS
 
         def contour(i):
-            band = math.floor(zs[i] / CONTOUR)
+            band = math.floor(zs[i] / apart)
             x, y = i % w, i // w
-            return any(math.floor(zs[j] / CONTOUR) < band for j, ok in
+            return any(math.floor(zs[j] / apart) < band for j, ok in
                        ((i + 1, x + 1 < w), (i - 1, x > 0), (i + w, y + 1 < h), (i - w, y > 0)) if ok)
 
         def shade(i, kind):

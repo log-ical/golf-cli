@@ -17,10 +17,11 @@ def main(argv=None):
     p.add_argument("--level", choices=CHOICES["level"], help="how good they are (saved)")
     p.add_argument("--weather", choices=CHOICES["weather"], help="live, random or calm (saved)")
     p.add_argument("--seed", type=int, help="play this round again: the same seed gives the same shots")
-    p.add_argument("--play", dest="mode", action="store_const", const="single player",
-                   help="single player: you play the round (saved)")
-    p.add_argument("--zen", dest="mode", action="store_const", const="zen",
-                   help="zen: watch made-up golfers play it (saved)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--play", dest="mode", action="store_const", const="single player",
+                      help="single player: you play the round (saved)")
+    mode.add_argument("--zen", dest="mode", action="store_const", const="zen",
+                      help="zen: watch made-up golfers play it (saved)")
     p.add_argument("--you", choices=CHOICES["player_level"], help="your level in single player (saved)")
     p.add_argument("--color", choices=["truecolor", "256", "16"], help="color mode (overrides the saved option)")
     p.add_argument("--symbols", choices=SYMBOL_SETS,

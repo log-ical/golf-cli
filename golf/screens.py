@@ -25,6 +25,7 @@ FRAME = 1 / 30        # seconds between frames while a ball moves
 CREDIT = "Map data © OpenStreetMap contributors · trees: © ESA WorldCover · heights: USGS, Mapzen · weather: Open-Meteo"
 CLOSE_KINDS = ("putt", "chip", "pitch", "bunker", "drop", "pickup")
 CLOSE_RANGE = 50     # yards from the hole: shots and balls in this close the view in on the green
+CUP_RANGE = 4.0      # and putts from in this close (12 ft), closer still on the cup
 TRAIL, TRAIL_NOW = 0.4, 0.65  # how strongly a trail tints the ground: past shots, the one in the air
 
 
@@ -144,7 +145,7 @@ def course_list_screen(term, menu, colors):
         left = max(0, (cols - width) // 2)
         lines += [" " * left + r for r in window]
         lines = with_footer(lines, rows - 1, cols, "↑/↓ choose   Enter play   Tab mode   / search   o options   q quit")
-        lines.append(center(DIM + CREDIT + RESET, cols))
+        lines.append(center(DIM + shorten(CREDIT, cols) + RESET, cols))
         term.draw(lines)
 
         key = term.read_key(0.1 if search else 0.5)
@@ -639,7 +640,8 @@ class Playback:
             else:
                 self.shown, self.phase, self.at = len(self.play.shots), "done", self.clock
         else:
-            if self.shown == 0 and self.phase in ("intro", "address", "shot") and self.hole_i > 0:
+            if self.shown == 0 and (self.phase == "intro" or self.phase == "address" and self.elapsed < 1.0) \
+                    and self.hole_i > 0:   # at the hole's start already: the one before
                 self.hole_i -= 1
             self.shown, self.phase, self.at = 0, "intro", self.clock
 
@@ -690,7 +692,7 @@ def standing(pb, cards, units):
         if s is None:
             now = DIM + "on the tee" + RESET if pb.phase not in ("summary", "done") else ""
         elif s.holed:
-            now = DIM + "holed out · %d" % s.number + RESET
+            now = DIM + "%s · %d" % ("picked up" if s.kind == "pickup" else "holed out", s.number) + RESET
         else:
             n = s.number + s.penalty
             now = DIM + "%d stroke%s · %s · %s" % (n, "" if n == 1 else "s", panels.LIE_WORDS.get(s.lie, s.lie),
@@ -749,11 +751,20 @@ class Views:
         self.ready = {}                 # key -> HoleMap, oldest first
         self.asked = set()              # keys given to the worker
         self.ways = {}                  # (hole, size) -> how its whole hole is turned
+        self.size = None                # the (cols, rows) last asked for: maps for other sizes aren't made
+        self.lock = threading.Lock()    # over ready and asked: the worker and get() both make maps
         self.jobs = queue.Queue()
-        threading.Thread(target=self._work, daemon=True).start()
+        threading.Thread(target=self._work, args=(self.jobs,), daemon=True).start()
+
+    def close(self):
+        """Stop the worker (after the map it's making) and let the maps go."""
+        self.jobs.put(None)
+        with self.lock:
+            self.ready.clear()
 
     def get(self, course, hole, cols, rows, aspect, level, quad, wait=False):
         """The map, or None while it's being made (unless wait)."""
+        self.size = (cols, rows)
         way, relief = settings["layout"], settings["relief"]
         if level != "hole":   # turned like the whole hole's (which takes no drawing to know)
             size = (id(hole), cols, rows, round(aspect, 3), quad, way)
@@ -764,32 +775,42 @@ class Views:
         m = self.ready.get(key)
         if m is None and wait:
             m = self._make(key, (course, hole, cols, rows, aspect, way, level, quad, relief))
-        elif m is None and key not in self.asked:
-            self.asked.add(key)
-            self.jobs.put((key, (course, hole, cols, rows, aspect, way, level, quad, relief)))
+        elif m is None:
+            with self.lock:
+                if key not in self.asked:
+                    self.asked.add(key)
+                    self.jobs.put((key, (course, hole, cols, rows, aspect, way, level, quad, relief)))
         return m
 
     def _make(self, key, args):
         course, hole, cols, rows, aspect, way, level, quad, relief = args
         m = render.HoleMap(course, hole, cols, rows, aspect, way=way, level=level, quad=quad, relief=relief)
         m.prepare(self.colors)
-        self.ready[key] = m
-        while len(self.ready) > self.KEEP:
-            old = next(iter(self.ready))
-            self.ready.pop(old, None)
-            self.asked.discard(old)
+        with self.lock:
+            self.ready[key] = m
+            for old in list(self.ready)[:max(0, len(self.ready) - self.KEEP)]:
+                del self.ready[old]
+                self.asked.discard(old)
         return m
 
-    def _work(self):
+    def _work(self, jobs):
         while True:
-            key, args = self.jobs.get()
+            job = jobs.get()
             try:
-                if key not in self.ready:
+                if job is None:   # closed
+                    return
+                key, args = job
+                if key in self.ready:
+                    pass
+                elif self.size is not None and args[2:4] != self.size:
+                    with self.lock:   # for a size the screen's no longer at (a resize): asked again if need be
+                        self.asked.discard(key)
+                else:
                     self._make(key, args)
             except Exception:   # a map that can't be made: the whole hole stands in for it
                 pass
             finally:
-                self.jobs.task_done()
+                jobs.task_done()
 
     def settle(self):
         """Wait until every map asked for is made (for tests)."""
@@ -821,7 +842,13 @@ def direct(scene, views, course, cols, rows, aspect, quad, ui, dt):
     m = whole
     if shot is not None:
         short = settings["green_view"] and shot.kind in CLOSE_KINDS and dist(shot.start, hole.pin) <= CLOSE_RANGE
-        if short and green is not None and green.covers(shot.start) and green.covers(shot.end):
+        # The cup's close-up for a short putt, made ahead once a ball is on the green.
+        on_green = short and (shot.kind == "putt" or shot.lie == "green")
+        cup = views.get(course, hole, cols, rows, aspect, "cup", quad) if on_green else None
+        if cup is not None and shot.kind == "putt" and dist(shot.start, hole.pin) <= CUP_RANGE and \
+                cup.covers(shot.start) and cup.covers(shot.end):
+            m = cup
+        elif short and green is not None and green.covers(shot.start) and green.covers(shot.end):
             m = green
         elif fairway is not None:
             m = fairway
@@ -833,7 +860,7 @@ def direct(scene, views, course, cols, rows, aspect, quad, ui, dt):
     else:
         ball = shot.start if phase == "address" else shot.end
     flying = phase == "shot" and elapsed < flight_time(shot)
-    if m.level == "green":
+    if m.level in render.CLOSE_LEVELS:
         target = lerp(ball, hole.pin, 0.5)
     else:
         span = m.cols * m.px * m.kx if m.way == "across" else m.rows * 2 * m.k
@@ -857,58 +884,61 @@ def watch_round(term, rnd, colors, menu):
     pb = Playback(rnd)
     views, ui = Views(colors), {}
     last = time.monotonic()
-    while True:
-        now = time.monotonic()
-        dt, last = min(0.5, now - last), now
-        if menu.open:
-            cols, rows = term.size()
-            term.draw(menu.render(cols, rows))
-            key = term.read_key(0.25)
+    try:
+        while True:
+            now = time.monotonic()
+            dt, last = min(0.5, now - last), now
+            if menu.open:
+                cols, rows = term.size()
+                term.draw(menu.render(cols, rows))
+                key = term.read_key(0.25)
+                if key == "\x0c":
+                    term.invalidate()
+                elif key:
+                    menu.handle_key(key)
+                continue
+            pb.tick(dt, PACES.get(settings["pace"], 1.0))
+            if pb.phase in ("pause", "summary") and len(rnd.played) <= pb.hole_i + 1 < len(rnd.holes):
+                rnd.play(pb.hole_i + 1)   # simulated while nothing moves, not as the next hole starts
+            term.draw(round_frame(term, pb, colors, views, ui, dt))
+            moving = pb.phase == "shot" and not pb.paused
+            key = term.read_key(FRAME if moving or ui.get("cam_moving") else 0.1)
+            if key is None:
+                continue
+            if key in ("q", "Q"):
+                return "quit"
+            if key in ("b", "esc", "\x7f"):
+                return "back"
             if key == "\x0c":
                 term.invalidate()
-            elif key:
-                menu.handle_key(key)
-            continue
-        pb.tick(dt, PACES.get(settings["pace"], 1.0))
-        if pb.phase in ("pause", "summary") and len(rnd.played) <= pb.hole_i + 1 < len(rnd.holes):
-            rnd.play(pb.hole_i + 1)   # simulated while nothing moves, not as the next hole starts
-        term.draw(round_frame(term, pb, colors, views, ui, dt))
-        moving = pb.phase == "shot" and not pb.paused
-        key = term.read_key(FRAME if moving or ui.get("cam_moving") else 0.1)
-        if key is None:
-            continue
-        if key in ("q", "Q"):
-            return "quit"
-        if key in ("b", "esc", "\x7f"):
-            return "back"
-        if key == "\x0c":
-            term.invalidate()
-        elif key == " ":
-            pb.paused = not pb.paused
-        elif key in ("right", "n"):
-            pb.skip()
-        elif key in ("left", "p"):
-            pb.back()
-        elif key in ("]", "pgdn"):
-            pb.jump_hole(1)
-        elif key in ("[", "pgup"):
-            pb.jump_hole(-1)
-        elif key in ("+", "=", "-", "_"):
-            step_pace(1 if key in ("+", "=") else -1)
-            save_settings()
-        elif key in ("z", "g", "t", "c"):
-            if key == "c":
-                settings["camera"] = "whole hole" if settings["camera"] == "broadcast" else "broadcast"
-            else:
-                k = {"z": "course_only", "g": "green_view", "t": "trails"}[key]
-                settings[k] = not settings[k]
-                if k == "course_only" and settings["course_only"]:
-                    ui["note"] = now + NOTE
-            save_settings()
-        elif key == "o":
-            menu.toggle()
-        elif key == "enter" and pb.phase == "done":
-            return "again"
+            elif key == " ":
+                pb.paused = not pb.paused
+            elif key in ("right", "n"):
+                pb.skip()
+            elif key in ("left", "p"):
+                pb.back()
+            elif key in ("]", "pgdn"):
+                pb.jump_hole(1)
+            elif key in ("[", "pgup"):
+                pb.jump_hole(-1)
+            elif key in ("+", "=", "-", "_"):
+                step_pace(1 if key in ("+", "=") else -1)
+                save_settings()
+            elif key in ("z", "g", "t", "c"):
+                if key == "c":
+                    settings["camera"] = "whole hole" if settings["camera"] == "broadcast" else "broadcast"
+                else:
+                    k = {"z": "course_only", "g": "green_view", "t": "trails"}[key]
+                    settings[k] = not settings[k]
+                    if k == "course_only" and settings["course_only"]:
+                        ui["note"] = now + NOTE
+                save_settings()
+            elif key == "o":
+                menu.toggle()
+            elif key == "enter" and pb.phase == "done":
+                return "again"
+    finally:
+        views.close()   # its worker, and the maps
 
 
 def high_detail():
@@ -936,7 +966,7 @@ def round_frame(term, pb, colors, views, ui=None, dt=0.0):
     bottom = 1 if show("show_keys") else 0
     playing = current.player if current and pb.phase in ("address", "shot") else None
     group = panels.group_rows(golfers, standing(pb, cards, units), colors, side_w if side else cols - 2, playing,
-                              two_lines=side) if show("show_group") else []
+                              two_lines=side, holes=len(rnd.holes)) if show("show_group") else []
     # Under the map: what the shot did, then (unless they're beside it) the
     # group, then the scorecard. The map keeps MIN_MAP rows: the scorecard
     # gives way first.
@@ -958,7 +988,7 @@ def round_frame(term, pb, colors, views, ui=None, dt=0.0):
     quad = high_detail()
     m = direct(pb.scene(), views, rnd.course, map_w, map_h, term.pixel_aspect(), quad, ui, dt)
     ui["cam_moving"] = m.level != "hole" and pb.phase in ("address", "pause")
-    close = m.level == "green"
+    close = m.level in render.CLOSE_LEVELS
 
     # The map's marks: trails, the flag, balls at rest, the ball in the air.
     done = pb.done_shots()
@@ -1016,7 +1046,8 @@ def round_frame(term, pb, colors, views, ui=None, dt=0.0):
         if len(title) + len(paused) > cols:
             title = panels.hole_title(rnd.course, hole, units)
         title = BOLD + shorten(title, cols - len(paused)) + RESET + (YELLOW + BOLD + paused + RESET if paused else "")
-        camera = {"hole": "", "fairway": "   ·   fairway camera", "green": "   ·   green camera"}[m.level]
+        camera = {"hole": "", "fairway": "   ·   fairway camera", "green": "   ·   green camera",
+                  "cup": "   ·   on the cup"}[m.level]
         weather = panels.weather_text(rnd.weather, heading(hole.tee, hole.pin), m.way, units) + \
             "   ·   %s pace%s" % (settings["pace"], camera)
         lines += [center(title, cols), center(DIM + shorten(weather, cols) + RESET, cols)]
