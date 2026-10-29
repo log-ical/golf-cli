@@ -27,7 +27,9 @@ the green and round it, the cup's a few yards round the hole (short putts). Each
 them, or that the camera has moved.
 """
 
+import itertools
 import math
+import threading
 
 from .course import TEE_RGB
 from .geo import Frame, bbox, dist, heading, lerp, step
@@ -94,13 +96,15 @@ UNSHADED = ("water", "sea", "pool", "stake") + ("trees", "trees2", "pines", "shr
 # top left 8, top right 4, bottom left 2, bottom right 1.
 QUADS = {8: "▘", 4: "▝", 2: "▖", 1: "▗", 12: "▀", 3: "▄", 10: "▌", 5: "▐", 9: "▚", 6: "▞", 14: "▛",
          13: "▜", 11: "▙", 7: "▟", 15: "█"}
-SPLITS = tuple((m, [i for i in range(4) if m >> (3 - i) & 1], [i for i in range(4) if not m >> (3 - i) & 1])
-               for m in (8, 9, 10, 11, 12, 13, 14))   # each way to split a cell in two, once
 
 CLOSE_LEVELS = ("green", "cup")   # the close-ups: labelled balls, contour lines
+LOOK_WORLD = 1.6     # how much bigger than the screen a look-around map is drawn, each way (it's drawn round
+                     # points half a screen apart: the screen's always on the nearest one's)
+POINTERS = "→↘↓↙←↖↑↗"   # toward something off the screen, clockwise from right
 
-_cache = {}          # terrain per view, see HoleMap.terrain
+_cache = {}          # terrain per view, see HoleMap.terrain (for another map of the same view)
 _CACHE_MAX = 8
+_cache_lock = threading.Lock()   # maps are made on a worker thread and on the screen's
 
 
 class HoleMap:
@@ -112,11 +116,14 @@ class HoleMap:
     quad: high detail, four pixels to a cell.
     """
 
-    def __init__(self, course, hole, cols, rows, aspect=1.0, way="auto", level="hole", quad=True, relief="on"):
+    def __init__(self, course, hole, cols, rows, aspect=1.0, way="auto", level="hole", quad=True, relief="on",
+                 center=None, scale=None):
         """level: "hole", the whole hole on screen; "fairway", closer, drawn
         the whole hole's size for the camera to follow the ball down it; or
         "green", a close-up of the green, drawn a little bigger than the screen;
-        or "cup", closer still round the hole, for short putts.
+        or "cup", closer still round the hole, for short putts; or "look",
+        `scale` yards a pixel round the course point `center`, drawn
+        LOOK_WORLD times the screen each way (looking around, l).
         relief: "on", the slopes shaded and the greens' contours drawn;
         "greens only", just the contours; "off", neither."""
         self.course, self.hole, self.level, self.relief = course, hole, level, relief
@@ -127,7 +134,12 @@ class HoleMap:
         self.frame = Frame(hole.tee, heading(hole.tee, hole.pin))
         g = hole.green.box
         green = [(g[0], g[1]), (g[0], g[3]), (g[2], g[1]), (g[2], g[3]), hole.pin]
-        if level in CLOSE_LEVELS:
+        if level == "look":
+            self.way = way if way in ("across", "up") else "across"
+            self.k = scale
+            self.wc, self.wr = math.ceil(self.cols * LOOK_WORLD), math.ceil(self.rows * LOOK_WORLD)
+            a0, c0 = a1, c1 = self.frame.to_frame(center)
+        elif level in CLOSE_LEVELS:
             self.way = way if way in ("across", "up") else "across"
             self.k = (CLOSE_SPAN if level == "green" else CUP_SPAN) / min(pa * vw, vh)
             self.wc, self.wr = math.ceil(self.cols * CLOSE_WORLD), math.ceil(self.rows * CLOSE_WORLD)
@@ -156,7 +168,12 @@ class HoleMap:
         else:                      # along the hole is up the screen, its right side screen x
             self.c_left, self.a_top = mid_c - self.kx * self.w / 2, mid_a + self.k * self.h / 2
         self.off = ((self.wc - self.cols) // 2, (self.wr - self.rows) // 2)   # the camera: the screen's top left cell
+        # Close enough to read a green by: the balls labelled, the contours drawn.
+        self.close = level in CLOSE_LEVELS or level == "look" and self.k <= CLOSE_SPAN / min(pa * vw, vh) * 1.5
+        # And close enough for the cup's finer contours.
+        self.fine = level == "cup" or level == "look" and self.k <= CUP_SPAN / min(pa * vw, vh) * 2
         self._rows = {}            # (row, column offset, color mode) -> that row drawn without marks
+        self._terrain = {}         # id(palette) -> terrain()
 
     # ----------------------------------------------------------------------
     # Course yards <-> pixels and cells
@@ -197,6 +214,41 @@ class HoleMap:
         row = round(y / 2 - self.rows / 2)
         self.off = (max(0, min(self.wc - self.cols, col)), max(0, min(self.wr - self.rows, row)))
 
+    def center(self):
+        """The course point in the middle of the screen, where the camera is."""
+        return self.to_course((self.off[0] + self.cols / 2) * self.px, (self.off[1] + self.rows / 2) * 2)
+
+    def fits(self, points, margin=1):
+        """Whether the camera can show all the course points at once, `margin`
+        cells in from the screen's edges: they're all in the drawing, and no
+        farther apart than the screen less its margins."""
+        xy = [self.to_pixel(p) for p in points]
+        if not all(0 <= x < self.w and 0 <= y < self.h for x, y in xy):
+            return False
+        xs, ys = [x for x, _ in xy], [y for _, y in xy]
+        return (max(xs) - min(xs)) / self.px <= self.cols - 1 - 2 * margin and \
+            (max(ys) - min(ys)) / 2 <= self.rows - 1 - 2 * margin
+
+    def middle(self, points):
+        """The course point in the middle of the points as they're drawn: aimed
+        at, the camera shows them all if they fit."""
+        xy = [self.to_pixel(p) for p in points]
+        xs, ys = [x for x, _ in xy], [y for _, y in xy]
+        return self.to_course((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+
+    def _edge(self, p):
+        """(col, row, arrow): where on the screen's edge to point toward an off-screen course point."""
+        x, y = self.to_pixel(p)
+        dx = x / self.px - self.off[0] - self.cols / 2
+        dy = y / 2 - self.off[1] - self.rows / 2
+        # Its direction as it looks: a cell is k * 2 yards tall and kx * px wide.
+        arrow = POINTERS[int((math.degrees(math.atan2(dy * 2 * self.k, dx * self.px * self.kx)) % 360 + 22.5)
+                             // 45) % 8]
+        t = min((self.cols / 2 - 0.5) / abs(dx) if dx else 1e9, (self.rows / 2 - 0.5) / abs(dy) if dy else 1e9)
+        col = max(0, min(self.cols - 1, math.floor(self.cols / 2 + dx * t)))
+        row = max(0, min(self.rows - 1, math.floor(self.rows / 2 + dy * t)))
+        return col, row, arrow
+
     def pixel_yards(self):
         """The smaller of a pixel's width and height, in yards."""
         return min(self.k, self.kx)
@@ -208,17 +260,25 @@ class HoleMap:
         """(pixel colors, cells): rows of (r, g, b), and rows of (character,
         foreground, background) cells drawing them. Made once per view."""
         key = (id(self.course), id(self.hole), self.wc, self.wr, self.px, self.way, round(self.k, 6),
-               round(self.kx, 6), self.level, id(palette), self.relief)
-        hit = _cache.get(key)
+               round(self.kx, 6), self.level, id(palette), self.relief, self.to_course(0, 0))
+        mine = self._terrain.get(id(palette))
+        if mine is not None:
+            return mine
+        with _cache_lock:
+            hit = _cache.get(key)
         # The ids are only good while the course and hole are alive: a new one can be given an old one's.
         if hit is not None and hit[0] is self.course and hit[1] is self.hole:
-            return hit[2]
-        pixels = self._paint(self._kinds(), palette)
-        made = (pixels, [[self._cell(pixels, x, y) for x in range(self.wc)] for y in range(self.wr)])
-        _cache.pop(key, None)
-        if len(_cache) >= _CACHE_MAX:
-            _cache.pop(next(iter(_cache)))
-        _cache[key] = (self.course, self.hole, made)
+            made = hit[2]
+        else:
+            pixels = self._paint(self._kinds(), palette)
+            cells = [[self._cell(pixels, x, y) for x in range(self.wc)] for y in range(self.wr)]
+            made = ([_Row(line) for line in pixels], cells)
+            with _cache_lock:
+                _cache.pop(key, None)
+                while len(_cache) >= _CACHE_MAX:
+                    _cache.pop(next(iter(_cache)), None)
+                _cache[key] = (self.course, self.hole, made)
+        self._terrain[id(palette)] = made   # kept with the map: it's drawn again every frame it's shown
         return made
 
     def prepare(self, colors):
@@ -420,29 +480,39 @@ class HoleMap:
         decks = _edges(flat, w, h, ("pool",))
         tall = set(TREES) | {k + "*" for k in TREES}
         single = self._single_trees(w, h)
-        jitter = {}
+        near = {}   # a crown's cell -> the crowns in it and round it: (a, c, shade)
 
         def crowns(a, c):
             """A wood's canopy from above at (a, c): bright at a crown's top,
             dark in the gaps, each crown a shade of its own."""
-            ca, cc = math.floor(a / CROWN), math.floor(c / CROWN)
-            best, tone = 9.0, 1.0
-            for i in (ca - 1, ca, ca + 1):
-                for j in (cc - 1, cc, cc + 1):
-                    spot = jitter.get((i, j))
-                    if spot is None:
-                        spot = jitter[(i, j)] = ((i + 0.2 + 0.6 * _hash(i, j)) * CROWN,
-                                                 (j + 0.2 + 0.6 * _hash(j + 7, i)) * CROWN, 0.88 + 0.24 * _hash(i + 3, j + 5))
-                    d = ((a - spot[0]) ** 2 + (c - spot[1]) ** 2) / (CROWN * CROWN)
-                    if d < best:
-                        best, tone = d, spot[2]
-            return (0.62 + 0.5 * max(0.0, 1 - best * 1.6)) * tone
+            cell = (math.floor(a / CROWN), math.floor(c / CROWN))
+            spots = near.get(cell)
+            if spots is None:
+                ca, cc = cell
+                spots = near[cell] = [((i + 0.2 + 0.6 * _hash(i, j)) * CROWN, (j + 0.2 + 0.6 * _hash(j + 7, i)) * CROWN,
+                                       0.88 + 0.24 * _hash(i + 3, j + 5))
+                                      for i in (ca - 1, ca, ca + 1) for j in (cc - 1, cc, cc + 1)]
+            best, tone = 9.0 * CROWN * CROWN, 1.0
+            for sa, sc, shade in spots:
+                d = (a - sa) * (a - sa) + (c - sc) * (c - sc)
+                if d < best:
+                    best, tone = d, shade
+            best /= CROWN * CROWN
+            return (0.62 + 0.5 * (1 - best * 1.6 if best < 0.625 else 0.0)) * tone
 
         def reach(yards):
             sx, sy = max(1, round(yards / self.kx)), max(1, round(yards / self.k))
             n = max(sx, sy)
             return [(round(t * sx / n), round(t * sy / n)) for t in range(1, n + 1)]
-        tree_reach, house_reach = reach(SHADOW), reach(HOUSE_SHADOW)
+        # What's in a tree's or a building's shadow: down and to the right of it, as far as it reaches.
+        shadowed = bytearray(w * h)
+        for spots, casts in ((reach(SHADOW), tall), (reach(HOUSE_SHADOW), set(BUILDINGS))):
+            for i, k in enumerate(flat):
+                if k in casts:
+                    x, y = i % w, i // w
+                    for dx, dy in spots:
+                        if x + dx < w and y + dy < h:
+                            shadowed[i + dy * w + dx] = 1
         relief = self._relief(flat)
         across = self.way == "across"
         out = []
@@ -503,12 +573,12 @@ class HoleMap:
                     f = 1.18 if up else 0.72   # lit on the sun's side, dark on the other
                 if relief is not None and not lit:
                     f *= relief(i, kind)
-                if kind not in tall and kind not in wet and kind not in BUILDINGS and kind != "stake":
-                    for spots, casts in ((tree_reach, tall), (house_reach, BUILDINGS)):
-                        if any(0 <= x - dx and 0 <= y - dy and flat[i - dy * w - dx] in casts for dx, dy in spots):
-                            f *= 0.7   # in a shadow
-                            break
-                line.append((min(255, int(r * f)), min(255, int(g * f)), min(255, int(b * f))))
+                if shadowed[i] and kind not in tall and kind not in wet and kind not in BUILDINGS and kind != "stake":
+                    f *= 0.7   # in a shadow
+                if f > 1:
+                    line.append((min(255, int(r * f)), min(255, int(g * f)), min(255, int(b * f))))
+                else:
+                    line.append((int(r * f), int(g * f), int(b * f)))
             out.append(line)
         return out
 
@@ -519,8 +589,8 @@ class HoleMap:
         if ground is None or self.relief not in ("on", "greens only"):
             return None
         w, h = self.w, self.h
-        close = self.level in CLOSE_LEVELS
-        apart = CUP_CONTOUR if self.level == "cup" else CONTOUR
+        close = self.close
+        apart = CUP_CONTOUR if self.fine else CONTOUR
         if self.relief == "greens only" and not close:
             return None
         zs = [ground.z(self.to_course(x + 0.5, y + 0.5)) for y in range(h) for x in range(w)]
@@ -556,14 +626,15 @@ class HoleMap:
     # ----------------------------------------------------------------------
     # Drawing
 
-    def lines(self, colors, marks=(), labels=(), box=None, tints=()):
+    def lines(self, colors, marks=(), labels=(), box=None, tints=(), pointers=()):
         """The rows on screen, where the camera is: terrain, with `tints`
         (course point, rgb, strength 0-1) coloring single pixels (the trails
         and shadows), `marks` on top, each (course point, character, rgb, bold)
         or with a fifth, rows to draw it higher up (a ball in the air), later
         ones over earlier; `labels` (course point, text, rgb) written beside
-        their point; and `box`, (text lines, rgb, background rgb), in the
-        middle of it all."""
+        their point; `pointers` (course point, rgb), an arrow at the screen's
+        edge toward each one that's off it (a ball the camera can't show);
+        and `box`, (text lines, rgb, background rgb), in the middle of it all."""
         palette = PALETTE16 if colors.mode == "16" else PALETTE
         pixels, cells = self.terrain(palette)
         oc, orow = self.off
@@ -577,6 +648,9 @@ class HoleMap:
                 spots[(x, y)] = rgb if colors.mode == "16" else _mix(base, rgb, strength)
         changed = {c: self._cell(pixels, c[0], c[1], spots) for c, spots in paint.items()}
         over = {}
+        for p, rgb in pointers:
+            if self.cell(p) is None:
+                over[self._edge(p)[:2]] = (self._edge(p)[2], rgb, True, None)
         for mark in marks:
             p, ch, rgb, bold = mark[:4]
             c = self.cell(p)
@@ -622,6 +696,35 @@ class HoleMap:
         return out
 
 
+class _Row:
+    """A row of pixel colors, kept as bytes (r, g, b each, a few megabytes
+    less a map than tuples), read back as (r, g, b) tuples."""
+    __slots__ = ("b",)
+
+    def __init__(self, colors):
+        self.b = bytes(itertools.chain.from_iterable(colors))
+
+    def __getitem__(self, x):
+        i, b = 3 * x, self.b
+        return (b[i], b[i + 1], b[i + 2])
+
+    def __len__(self):
+        return len(self.b) // 3
+
+    def __iter__(self):
+        b = self.b
+        return ((b[i], b[i + 1], b[i + 2]) for i in range(0, len(b), 3))
+
+    def __eq__(self, other):
+        return isinstance(other, _Row) and self.b == other.b
+
+
+def span_scale(span, cols, rows, aspect):
+    """Yards a pixel for a map that shows `span` yards across the screen's
+    shorter side (as the close-ups do; the same in either detail)."""
+    return span / min(aspect * max(1, cols), max(1, rows) * 2)
+
+
 def surface(kind):
     """How a ball plays on a drawn kind of ground (as course.surface_at says)."""
     kind = kind.rstrip("*")
@@ -657,13 +760,13 @@ def _noise(a, c, scale):
 def _spread(flat, w, h, sources, into, steps):
     """Pixels of the kinds `into` within `steps` pixels of one of `sources`
     (flat: the kinds, a row after another, w wide)."""
-    into = set(into)
+    into, sources, n = set(into), set(sources), len(flat)
     frontier, seen = [], set()
     for i, k in enumerate(flat):
         if k in sources:
             x = i % w
             for j in (i - w, i + w, i - 1 if x else -1, i + 1 if x + 1 < w else -1):
-                if 0 <= j < len(flat) and flat[j] in into and j not in seen:
+                if 0 <= j < n and flat[j] in into and j not in seen:
                     seen.add(j)
                     frontier.append(j)
     for _ in range(steps - 1):
@@ -671,7 +774,7 @@ def _spread(flat, w, h, sources, into, steps):
         for i in frontier:
             x = i % w
             for j in (i - w, i + w, i - 1 if x else -1, i + 1 if x + 1 < w else -1):
-                if 0 <= j < len(flat) and flat[j] in into and j not in seen:
+                if 0 <= j < n and flat[j] in into and j not in seen:
                     seen.add(j)
                     nxt.append(j)
         frontier = nxt
@@ -703,31 +806,29 @@ def _seg_d2(p, a, b):
 
 def _fit4(px):
     """The quadrant cell that best draws four pixels (top left, top right,
-    bottom left, bottom right) in two colors."""
-    a = px[0]
-    if px[1] == a and px[2] == a and px[3] == a:
+    bottom left, bottom right) in two colors: the split of them into two
+    groups that leaves the least squared error round each group's mean
+    (which is the split whose groups' sums, squared over their sizes, add up
+    to the most)."""
+    a, b, c, d = px
+    if a == b and a == c and a == d:
         return (" ", None, a)
-    other = {p for p in px if p != a}
-    if len(other) == 1:   # two colors: exact
-        mask = sum(8 >> i for i in range(4) if px[i] == a)
-        return (QUADS[mask], a, other.pop())
-    best = None
-    for mask, ins, outs in SPLITS:
-        f, b = _mean([px[i] for i in ins]), _mean([px[i] for i in outs])
-        err = sum(_d2(px[i], f) for i in ins) + sum(_d2(px[i], b) for i in outs)
-        if best is None or err < best[0]:
-            best = (err, mask, f, b)
-    _, mask, f, b = best
-    return (QUADS[mask], f, b)
-
-
-def _mean(colors):
-    n = len(colors)
-    return (sum(c[0] for c in colors) // n, sum(c[1] for c in colors) // n, sum(c[2] for c in colors) // n)
-
-
-def _d2(a, b):
-    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+    tr, tg, tb = a[0] + b[0] + c[0] + d[0], a[1] + b[1] + c[1] + d[1], a[2] + b[2] + c[2] + d[2]
+    best, mask, fg = -1.0, 0, None
+    # Splits with the top left pixel in the foreground group: its mask, and that group's pixels.
+    for m, group in ((8, (a,)), (12, (a, b)), (10, (a, c)), (9, (a, d)), (14, (a, b, c)), (13, (a, b, d)),
+                     (11, (a, c, d))):
+        n = len(group)
+        sr = sg = sb = 0
+        for p in group:
+            sr += p[0]
+            sg += p[1]
+            sb += p[2]
+        ur, ug, ub = tr - sr, tg - sg, tb - sb
+        score = (sr * sr + sg * sg + sb * sb) / n + (ur * ur + ug * ug + ub * ub) / (4 - n)
+        if score > best:
+            best, mask, fg = score, m, (sr // n, sg // n, sb // n, ur // (4 - n), ug // (4 - n), ub // (4 - n))
+    return (QUADS[mask], fg[:3], fg[3:])
 
 
 def _mix(a, b, f):

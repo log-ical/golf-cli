@@ -12,11 +12,12 @@ shot you can play and how well you strike it.
 
 import copy
 import dataclasses
+import math
 import random
 
 from . import engine
 from .engine import MAX_STROKES, Ball, Swing
-from .geo import dist, heading, step
+from .geo import dist, heading, lerp, step
 from .sim import Player
 
 POWER_MIN = 0.1
@@ -104,7 +105,7 @@ class Game:
         b = heading(ball.pos, self.hole.pin)
         keys = self.clubs()
         if ball.lie == "green" or (keys[-1] == "P" and d <= 10 and ball.lie != "rough"):
-            return Setup("P", "putt", b, 1.0, max(LENGTH_MIN, round((d + engine.PUTT_PAST) * 3) / 3))
+            return Setup("P", "putt", b, 1.0, self.putt_length(d + engine.PUTT_PAST))
         keys = [k for k in keys if k != "P"]
         if self.help == "none" and self.last_club in keys:
             key = self.last_club
@@ -113,16 +114,46 @@ class Game:
         if d <= SHORT and ball.lie != "tee":
             kind = "blast" if ball.lie == "bunker" and d <= 30 else "pitch"
             key = "SW" if "SW" in keys else keys[-1]
-            t = engine.BY_TYPE[kind]
-            full = self.player.carry(Swing(engine.club(key), b, kind, 1.0), ball.lie)
-            return Setup(key, kind, b, max(POWER_MIN, min(1.0, round(d / (1 + t.roll) / max(full, 1), 2))), 0.0)
+            return Setup(key, kind, b, self.short_power(key, kind, d), 0.0)
         key = keys[0]
         for k in reversed(keys):   # the shortest that carries it
             if self.player.carry(Swing(engine.club(k), b, "full", 1.0), ball.lie) >= d:
                 key = k
                 break
         kinds = engine.types_for(key, ball.lie, self.level)
-        return Setup(key, kinds[0], b, 1.0, 0.0)
+        full = self.player.carry(Swing(engine.club(key), b, kinds[0], 1.0), ball.lie)
+        power = 1.0 if key != keys[-1] or full <= d else max(POWER_MIN, round(d / full, 2))   # a wedge swung softer
+        return Setup(key, kinds[0], b, power, 0.0)
+
+    def short_power(self, key, kind, d):
+        """How hard to hit a chip, pitch or splash with a club for it to fly
+        and run out d yards (in still air, on the flat)."""
+        t = engine.BY_TYPE[kind]
+        full = self.player.carry(Swing(engine.club(key), 0, kind, 1.0), self.ball.lie)
+        return max(POWER_MIN, min(1.0, round(d / (1 + t.roll) / max(full, 1), 2)))
+
+    def putt_length(self, d):
+        """The length to set a putt to for it to roll d yards along the line
+        to the hole on the flat: longer for the fringe or the fairway on the
+        way, which take more rolling over than the green (to a third of a
+        foot, as the arrows set it)."""
+        a, b = self.ball.pos, self.hole.pin
+        n = max(1, int(d * 2))
+        way = heading(a, b)
+        cost = sum(engine.PUTT_COST.get(self.player.surface(step(a, way, (i + 0.5) * d / n)), 4.0) for i in range(n))
+        return max(LENGTH_MIN, min(LENGTH_MAX, round(cost * d / n * 3) / 3))
+
+    def flat_roll(self, length):
+        """How far a putt struck to roll `length` rolls along its line on the
+        flat (less where it's over the fringe or the fairway)."""
+        a, way, rolled, left, stride = self.ball.pos, self.setup.bearing, 0.0, length, 0.25
+        while left > 0 and rolled < 3 * LENGTH_MAX:
+            cost = engine.PUTT_COST.get(self.player.surface(step(a, way, rolled + stride / 2)))
+            if cost is None:
+                break
+            go = min(stride, left / cost)
+            rolled, left = rolled + go, left - go * cost
+        return rolled
 
     def caddie(self):
         """The caddie's suggestion for the ball where it is."""
@@ -131,7 +162,7 @@ class Game:
         kinds = engine.types_for(key, self.ball.lie, self.level)
         kind = swing.kind if swing.kind in kinds else kinds[0]
         length = swing.length or dist(self.ball.pos, self.hole.pin) + engine.PUTT_PAST
-        return Setup(key, kind, swing.bearing, min(1.0, swing.power), length)
+        return Setup(key, kind, swing.bearing, min(engine.OVERSWING, swing.power), min(LENGTH_MAX, length))
 
     def clubs(self):
         return engine.club_keys(self.ball.lie, self.to_pin)
@@ -148,20 +179,40 @@ class Game:
         g = self.course.ground
         return 0.0 if g is None else g.z(self.hole.pin) - g.z(self.ball.pos)
 
+    def break_across(self):
+        """The slope across the line from the ball to the hole, on average
+        (rise a yard: more than 0 is higher on the right, so a putt falls away
+        to the left, breaking right to left); 0 on flat ground."""
+        g, a, b = self.course.ground, self.ball.pos, self.hole.pin
+        if g is None or dist(a, b) < 0.1:
+            return 0.0
+        r = math.radians(heading(a, b))
+        n = max(2, int(dist(a, b)))
+        total = 0.0
+        for i in range(n):
+            gx, gy = g.slope(lerp(a, b, (i + 0.5) / n))
+            total += gx * math.cos(r) - gy * math.sin(r)
+        return total / n
+
     def change_club(self, step):
         """The next (step 1) or previous (-1) club, longest first; the kind of
         shot stays if the new club can play it."""
         keys = self.clubs()
         i = keys.index(self.setup.club) if self.setup.club in keys else 0
-        if self.setup.club == "P" and step > 0 and len(keys) > 1:
+        chip = self.setup.club == "P" and step > 0 and len(keys) > 1
+        if chip:
             self.setup.club = keys[-2]   # off the putter (c): the shortest club, for a chip, not the driver
         else:
             self.setup.club = keys[(i + step) % len(keys)]
         kinds = self.kinds()
-        if self.setup.kind not in kinds:
+        if chip:   # set up to run out to the hole
+            self.setup.kind = next((k for k in ("chip", "pitch") if k in kinds), kinds[0])
+            if engine.BY_TYPE[self.setup.kind].short:
+                self.setup.power = self.short_power(self.setup.club, self.setup.kind, self.to_pin + 0.3)
+        elif self.setup.kind not in kinds:
             self.setup.kind = kinds[0]
         if self.setup.club == "P" and not self.setup.length:
-            self.setup.length = self.to_pin + engine.PUTT_PAST
+            self.setup.length = self.putt_length(self.to_pin + engine.PUTT_PAST)
 
     def change_kind(self, step):
         kinds = self.kinds()
@@ -175,7 +226,10 @@ class Game:
         self.setup.bearing = heading(self.ball.pos, self.hole.pin)
 
     def change_power(self, delta):
-        self.setup.power = max(POWER_MIN, min(1.0, round(self.setup.power + delta, 2)))
+        """More or less power, to 100% (the caddie's setup can be over it, a little)."""
+        if delta > 0 and self.setup.power >= 1.0:
+            return   # (the caddie's can be over, a little: + doesn't bring it down)
+        self.setup.power = max(POWER_MIN, min(max(1.0, self.setup.power), round(self.setup.power + delta, 2)))
 
     def change_length(self, delta):
         self.setup.length = max(LENGTH_MIN, min(LENGTH_MAX, self.setup.length + delta))
@@ -196,6 +250,16 @@ class Game:
         """(where it lands, where it stops, whether it drops) if struck just as set up."""
         return self.player.preview(self.ball, self.swing())
 
+    def planned(self):
+        """The shot as set up, struck just as meant in the wind as it usually
+        blows (an engine.Shot, not played): its flight, its roll, where it stops."""
+        return self.player.planned(self.ball, self.swing())
+
+    def still_air(self):
+        """The shot as set up, struck as meant in still air over flat ground,
+        as far as it comes down (a putt: rolled out on the flat)."""
+        return self.player.still_air(self.ball, self.swing())
+
     def carry(self):
         """How far it flies as set up, in still air (a putt: its length)."""
         if self.setup.club == "P":
@@ -203,8 +267,8 @@ class Game:
         return self.player.carry(self.swing(), self.ball.lie)
 
     def carry_spot(self):
-        """Where it'd come down in still air, struck as meant, before any curve."""
-        return step(self.ball.pos, self.setup.bearing, self.carry())
+        """Where it'd come down in still air, struck as meant, curving as its kind of shot does."""
+        return self.still_air().end
 
     # ----------------------------------------------------------------------
     # Hitting it
@@ -225,7 +289,7 @@ class Game:
                 stats.putts += 1
             if first and self.hole.par > 3:
                 stats.fairway = shot.lie == "fairway"
-            if (shot.lie == "green" or shot.holed) and ball.strokes <= self.hole.par - 2:
+            if (ball.lie == "green" or shot.holed) and ball.strokes <= self.hole.par - 2:   # (not another's green)
                 stats.green = True
         self.shots += shots
         if ball.holed:

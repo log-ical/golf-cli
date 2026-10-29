@@ -48,6 +48,34 @@ class GameTest(unittest.TestCase):
         g.take_suggestion()
         self.assertIsNotNone(g.suggested)
 
+    def test_yardages_set_a_soft_wedge_inside_its_full_carry(self):
+        g = a_game(help="yardages")
+        g.ball.pos, g.ball.lie = (g.hole.pin[0] - 60, g.hole.pin[1]), "fairway"
+        g.suggest()
+        self.assertEqual((g.setup.club, g.setup.kind), ("LW", "full"))
+        self.assertLess(g.setup.power, 1.0)
+        self.assertAlmostEqual(g.carry(), 60, delta=1)       # it carries the distance, not the club's full 80-odd
+
+    def test_off_the_putter_is_a_chip(self):
+        g = a_game(help="none")
+        g.ball.pos, g.ball.lie = (g.hole.pin[0] - 8, g.hole.pin[1]), "fairway"
+        g.suggest()
+        self.assertEqual(g.setup.club, "P")
+        g.change_club(1)                                      # c
+        self.assertEqual((g.setup.club, g.setup.kind), ("LW", "chip"))
+        _, end, _ = g.preview()
+        self.assertLess(dist(end, g.hole.pin), 4)             # set up to run out to the hole
+
+    def test_a_putt_from_the_fringe_is_set_to_get_there(self):
+        g = a_game(help="yardages")
+        g.ball.pos, g.ball.lie = g.hole.pin, "green"
+        surface = g.player.surface
+        g.player.surface = lambda p: "fairway" if p[0] < g.hole.pin[0] - 4 else surface(p)   # 4 yards of fringe
+        g.ball.pos = (g.hole.pin[0] - 8, g.hole.pin[1])
+        g.suggest()
+        self.assertGreater(g.setup.length, 8 + 0.5 + 2)       # more than the distance: the fringe takes some
+        self.assertAlmostEqual(g.flat_roll(g.setup.length), 8.5, delta=0.3)
+
     def test_with_no_help_its_all_yours(self):
         g = a_game(help="none", seed=2)
         self.assertFalse(g.caddie_on_hand)
@@ -204,8 +232,87 @@ class ScreenTest(unittest.TestCase):
         scr.go("aim", 10.0)
         play.handle(scr, " ", 10.0 + play.SETTLE / 2, None)
         self.assertEqual((scr.phase, g.ball.strokes), ("aim", 0))
-        play.handle(scr, " ", 10.0 + play.SETTLE + 0.01, None)
+        play.handle(scr, " ", 10.0 + play.SETTLE * 1.5 + 0.01, None)   # a pause since the last press: it swings
         self.assertEqual(scr.phase, "meter" if play.on_meter(g) else "flight")
+
+    def test_holding_space_never_swings(self):
+        for swing in ("meter", "simple"):
+            cfg.settings["swing"] = swing
+            g = a_game(help="yardages")
+            scr = play.Screen(g, Colors("256"))
+            scr.go("result", 0.0)
+            t = 0.0
+            while t < 3.0:                               # the key held down: repeating 30 times a second
+                play.handle(scr, " ", t, None)
+                t += 1 / 30
+            self.assertEqual((scr.phase, g.ball.strokes), ("aim", 0), swing)
+
+    def test_esc_on_the_meter_is_not_this_swing_and_leaving_asks_twice(self):
+        cfg.settings["swing"] = "meter"
+        g = a_game(help="yardages")
+        scr = play.Screen(g, Colors("256"))
+        scr.go("aim", 0.0)
+        play.handle(scr, " ", 1.0, None)
+        self.assertEqual(scr.phase, "meter")
+        self.assertIsNone(play.handle(scr, "esc", 1.2, None))
+        self.assertEqual((scr.phase, scr.meter, g.ball.strokes), ("aim", None, 0))
+        self.assertEqual(play.handle(scr, "b", 1.3, None), "back")   # nothing played yet: nothing to lose
+        g.hit()
+        scr.go("aim", 2.0)
+        self.assertIsNone(play.handle(scr, "b", 3.0, None))           # a round in play: are you sure?
+        self.assertIn("b again to leave the round", _SGR.sub("", play.frame(FakeTerm(120, 40), scr, 3.0, 0)[-1]))
+        self.assertEqual(play.handle(scr, "b", 3.5, None), "back")
+        self.assertIsNone(play.handle(scr, "q", 4.0, None))
+        self.assertIsNone(play.handle(scr, "s", 4.1, None))           # anything else: playing on
+        self.assertIsNone(play.handle(scr, "q", 4.2, None))
+        self.assertEqual(play.handle(scr, "q", 4.3, None), "quit")
+
+    def test_esc_while_looking_only_stops_looking(self):
+        g = a_game(help="yardages")
+        g.hit()                                          # a round in play
+        scr = play.Screen(g, Colors("256"))
+        scr.go("aim", 0.0)
+        play.frame(FakeTerm(120, 40), scr, 1.0, 0.0)
+        play.handle(scr, "l", 1.0, None)
+        self.assertTrue(scr.ui["look"].on)
+        self.assertIsNone(play.handle(scr, "esc", 1.1, None))
+        self.assertFalse(scr.ui["look"].on)
+        self.assertIsNone(scr.leaving)                   # not asked about leaving
+
+    def test_tapping_right_keeps_aiming(self):
+        g = a_game(help="yardages")
+        scr = play.Screen(g, Colors("256"))
+        scr.go("aim", 0.0)
+        start = g.setup.bearing
+        for i in range(10):
+            play.handle(scr, "right", 1.0 + i * 0.1, None)
+        self.assertAlmostEqual((g.setup.bearing - start) % 360, 10 * play.AIM)
+        play.handle(scr, " ", 2.0, None)                 # and a swing straight after
+        self.assertNotEqual(scr.phase, "aim")
+
+    def test_looking_from_the_intro(self):
+        g = a_game()
+        scr = play.Screen(g, Colors("256"))
+        scr.go("intro", 0.0)
+        play.frame(FakeTerm(120, 40), scr, 0.1, 0.0)
+        play.handle(scr, "l", 0.2, None)
+        self.assertTrue(scr.ui["look"].on)
+        self.assertIs(scr.ui["look"].hole, g.hole)
+
+    def test_plus_leaves_the_caddies_extra_alone(self):
+        g = a_game()
+        g.setup.power = 1.05
+        g.change_power(0.05)
+        self.assertEqual(g.setup.power, 1.05)
+        g.change_power(-0.05)
+        self.assertEqual(g.setup.power, 1.0)
+
+    def test_a_soft_swing_still_gives_time_to_strike(self):
+        m = play.Meter(0.0)
+        m.press(0.1)                                     # 10% power
+        self.assertEqual(m.power, 0.1)
+        self.assertGreater(m.value(0.1 + play.DOWN - 0.25), m.window)   # the mark's still to come...
+        self.assertEqual(m.press(0.1 + play.DOWN), (0.1, 0.0))           # ...and struck on it, it's pure
 
     def test_the_setup_shows(self):
         g = a_game(help="yardages")
@@ -231,6 +338,58 @@ class ScreenTest(unittest.TestCase):
         bare = play.frame(FakeTerm(120, 40), scr, 0.0, 0.0)
         self.assertEqual(len(bare), 40)
         self.assertNotIn("Driver", "\n".join(_SGR.sub("", l) for l in bare))
+
+    def test_reading_a_putt(self):
+        self.assertEqual(play.read_words(0.0, 0.0, "yards"), "level · straight")
+        self.assertEqual(play.read_words(1 / 12, 0.015, "yards"), "3 in uphill · breaks right to left, 1.5%")
+        self.assertEqual(play.read_words(-1.0, -0.02, "yards"), "3 ft downhill · breaks left to right, 2.0%")
+        g = a_game(help="yardages")
+        g.ball.pos, g.ball.lie = (g.hole.pin[0], g.hole.pin[1] - 3), "green"   # 3 yards south, putting north
+        g.suggest()
+        g.course.ground = Plane(0.02, 0)               # higher to the east: on the right, so it breaks to the left
+        self.assertGreater(g.break_across(), 0.019)
+        scr = play.Screen(g, Colors("256"))
+        scr.go("aim", 0.0)
+        text = "\n".join(_SGR.sub("", l) for l in play.frame(FakeTerm(140, 40), scr, 0.0, 0.0))
+        self.assertIn("breaks right to left, 2.0%", text)
+
+    def test_the_caddie_shows_the_putt_breaking(self):
+        g = a_game(help="caddie")
+        g.ball.pos, g.ball.lie = (g.hole.pin[0], g.hole.pin[1] - 4), "green"
+        g.course.ground = g.player.ground = Plane(0.02, 0)
+        g.suggest()
+        plan = play.aim_shot(g)
+        self.assertTrue(plan.holed and plan.path)       # read to drop, along a curve
+        m = play.Screen(g, Colors("256")).views.get(g.course, g.hole, 120, 30, 1.0, "green", True, wait=True)
+        tints, marks = play.aim_marks(g, m, plan)
+        self.assertGreater(max(p[0] for p, _, _ in tints), g.ball.pos[0] + 0.1)   # bowed up the slope, not straight
+        self.assertEqual(marks, [])                     # no cross where it drops
+
+    def test_keys_help_and_looking_around(self):
+        g = a_game()
+        scr = play.Screen(g, Colors("256"))
+        scr.go("aim", 0.0)
+        term = FakeTerm(120, 40)
+        play.frame(term, scr, 1.0, 0.0)
+        play.handle(scr, "?", 1.0, None)
+        self.assertIn("Single player: the keys", "".join(_SGR.sub("", l) for l in play.frame(term, scr, 1.0, 0.0)))
+        play.handle(scr, "x", 1.0, None)               # any key: back
+        self.assertNotIn("help", scr.ui)
+        bearing = g.setup.bearing
+        play.handle(scr, "l", 1.0, None)
+        self.assertTrue(scr.ui["look"].on)
+        play.handle(scr, "right", 1.0, None)           # the camera moves, the aim doesn't
+        play.handle(scr, "+", 1.0, None)
+        self.assertEqual(g.setup.bearing, bearing)
+        play.frame(term, scr, 1.0, 0.0)                # (its map asked for, and made)
+        scr.views.settle()
+        play.frame(term, scr, 1.0, 0.0)
+        self.assertEqual(scr.ui["map"].level, "look")
+        play.handle(scr, " ", 1.0, None)               # done looking: no swing
+        self.assertFalse(scr.ui["look"].on)
+        self.assertEqual((scr.phase, g.ball.strokes), ("aim", 0))
+        play.handle(scr, "esc", 1.0, None)
+        self.assertEqual(play.handle(scr, "esc", 1.0, None), "back")   # (looking, Esc only stops looking)
 
 
 if __name__ == "__main__":

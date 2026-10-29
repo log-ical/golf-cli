@@ -179,6 +179,60 @@ class SlopeTest(unittest.TestCase):
         _, green, _ = self.striker(Plane(0.4, 0)).preview(Ball(step(self.hole.pin, 180, 5), "green"), swing)
         self.assertLess(dist(step(self.hole.pin, 180, 5), green), 3)   # a green's no steeper than greens are built
 
+    def test_a_breaking_putt_rolls_the_way_it_breaks(self):
+        pin = self.hole.pin
+        start = step(pin, 180, 6)
+        st = self.striker(Plane(0.03, 0))
+        shot = st.strike(Ball(start, "green"), Swing(engine.PUTTER, 0, "putt", length=6, timing=0.0))[0]
+        self.assertEqual((shot.path[0], shot.path[-1]), (start, shot.end))
+        self.assertLessEqual(len(shot.path), engine.ROLL_POINTS)
+        mid = shot.path[len(shot.path) // 2]
+        self.assertGreater(_right_of(start, heading(start, shot.end), mid), 0.05)   # bowed up the slope (east)
+        flat = self.striker(None).strike(Ball(start, "green"), Swing(engine.PUTTER, 0, "putt", length=6))[0]
+        self.assertEqual(flat.path, ())                                              # a straight roll needs none
+
+    def test_planned_and_still_air_shots(self):
+        b = heading(self.hole.tee, self.hole.pin)
+        st = self.striker(None)
+        ball = Ball(self.hole.tee, "tee")
+        for kind in ("full", "draw", "fade"):
+            swing = Swing(engine.club("7i"), b, kind, 1.0)
+            plan = st.planned(ball, swing)
+            self.assertEqual((plan.land, plan.end, plan.holed), st.preview(ball, swing))
+            self.assertEqual((plan.start, plan.number, ball.strokes), (ball.pos, 1, 0))   # not played
+            still = st.still_air(ball, swing)
+            self.assertEqual(still.land, still.end)                                    # no roll
+            side = _right_of(ball.pos, b, still.land)
+            if kind == "draw":
+                self.assertLess(side, -3)       # a draw comes down left of the line, in still air too
+            elif kind == "fade":
+                self.assertGreater(side, 3)
+            else:
+                self.assertAlmostEqual(side, 0, delta=0.01)
+
+    def test_a_driver_curves_more_than_a_wedge(self):
+        self.assertGreater(engine.curve_factor(engine.club("D")), 1.0)
+        self.assertLess(engine.curve_factor(engine.club("LW")), 0.7)
+        b = heading(self.hole.tee, self.hole.pin)
+        ball = Ball(self.hole.tee, "tee")
+        st = self.striker(None)
+        bend = lambda key: abs(_right_of(ball.pos, b, st.still_air(ball, Swing(engine.club(key), b, "fade")).land))
+        # Degrees of curve, as the clubs fly: the long club bends it more for its length.
+        self.assertGreater(bend("3W") / engine.club("3W").carry, bend("9i") / engine.club("9i").carry)
+
+    def test_free_relief_off_the_wrong_green(self):
+        c = osm.parse(tiny_course(), "relation", 1)[0]
+        mine, other = c.holes[0], c.holes[1]
+        st = engine.Striker(c, mine, golfer(), 0, wx.Weather(), random.Random(0))
+        ball = Ball(other.pin, "fairway")
+        shots = st.finish(ball, "approach", "7-iron", other.pin, other.pin, other.pin, "", False)
+        self.assertEqual([s.kind for s in shots], ["approach", "drop"])
+        drop = shots[1]
+        self.assertEqual((drop.miss, drop.penalty, ball.strokes), ("relief", 0, 1))   # free
+        self.assertNotEqual(st.surface(ball.pos), "green")
+        self.assertNotEqual(ball.lie, "green")
+        self.assertGreaterEqual(dist(ball.pos, mine.pin), dist(other.pin, mine.pin))   # no nearer the hole
+
 
 def _right_of(origin, bearing, p):
     """Yards p is right of the line from origin on bearing."""

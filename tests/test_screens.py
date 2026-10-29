@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 from tests.helpers import ROOT, tiny_course  # noqa: F401
-from golf import catalog, osm, panels, players, scoring, screens, sim
+from golf import camera, catalog, osm, panels, players, scoring, screens, sim, zen
 from golf import settings as cfg
 from golf import weather as wx
 from golf.geo import dist
@@ -35,7 +35,7 @@ class FakeTerm:
 class PlaybackTest(unittest.TestCase):
     def test_plays_every_shot_then_moves_on(self):
         rnd = a_round()
-        pb = screens.Playback(rnd)
+        pb = zen.Playback(rnd)
         seen = []
         for _ in range(100000):
             if pb.phase == "shot":
@@ -49,7 +49,7 @@ class PlaybackTest(unittest.TestCase):
 
     def test_the_pace_never_hurries_a_shot(self):
         for pace in (0.5, 4.0):
-            pb = screens.Playback(a_round())
+            pb = zen.Playback(a_round())
             pb.skip()
             pb.skip()
             self.assertEqual(pb.phase, "shot")
@@ -60,10 +60,10 @@ class PlaybackTest(unittest.TestCase):
             pb.tick(0.25, pace)
             self.assertAlmostEqual(pb.elapsed, 0.25 * pace)  # between shots: at the pace
         shot = a_round().play(0).shots[0]
-        self.assertGreater(screens.flight_time(shot), 4)     # a drive hangs about five seconds
+        self.assertGreater(camera.flight_time(shot), 4)     # a drive hangs about five seconds
 
     def test_pause_skip_back_and_holes(self):
-        pb = screens.Playback(a_round())
+        pb = zen.Playback(a_round())
         pb.paused = True
         pb.tick(10, 1.0)
         self.assertEqual((pb.phase, pb.elapsed), ("intro", 0.0))   # nothing moves while paused
@@ -85,7 +85,7 @@ class PlaybackTest(unittest.TestCase):
 
     def test_cards_show_only_whats_been_played(self):
         rnd = a_round()
-        pb = screens.Playback(rnd)
+        pb = zen.Playback(rnd)
         self.assertTrue(all(s is None for card in pb.cards() for s in card))
         pb.jump_hole(1)
         cards = pb.cards()
@@ -94,15 +94,18 @@ class PlaybackTest(unittest.TestCase):
 
     def test_ball_moves_from_start_to_end_and_flies(self):
         shot = a_round().play(0).shots[0]
-        self.assertEqual(screens.ball_at(shot, 0), shot.start)
-        self.assertEqual(screens.ball_at(shot, 1e9), shot.end)
-        f = screens.flight_time(shot)
-        mid = screens.ball_at(shot, f / 2)
+        self.assertEqual(camera.ball_at(shot, 0), shot.start)
+        self.assertEqual(camera.ball_at(shot, 1e9), shot.end)
+        f = camera.flight_time(shot)
+        mid = camera.ball_at(shot, f / 2)
         self.assertNotIn(mid, (shot.start, shot.end))
         self.assertGreater(dist(shot.start, mid), dist(mid, shot.land))   # the air slows it down
-        self.assertGreater(screens.height_at(shot, f / 2), 20)
-        self.assertEqual(screens.height_at(shot, f + 0.1), 0)
-        self.assertGreater(len(screens.trail(shot, 1e9, 2.0)), 10)
+        self.assertGreater(camera.height_at(shot, f / 2), 20)
+        hop = camera.height_at(shot, f + 0.1)   # it lands, hops and runs out along the way it rolled
+        self.assertTrue(0 < hop < camera.height_at(shot, f / 2) / 5)
+        self.assertEqual(camera.height_at(shot, f + camera.HOP_TIME + 0.01), 0)
+        self.assertLess(dist(camera.ball_at(shot, f + camera.roll_time(shot) * 0.9999), shot.end), 0.01)
+        self.assertGreater(len(camera.trail(shot, 1e9, 2.0)), 10)
 
 
 class FrameTest(unittest.TestCase):
@@ -116,7 +119,7 @@ class FrameTest(unittest.TestCase):
     def frames(self, pb, size, views, steps=60, skips=3):
         ui = {}
         for _ in range(steps):
-            lines = screens.round_frame(FakeTerm(*size), pb, views.colors, views, ui, 0.05)
+            lines = zen.round_frame(FakeTerm(*size), pb, views.colors, views, ui, 0.05)
             yield lines, ui
             for _ in range(skips):
                 pb.skip()
@@ -124,83 +127,225 @@ class FrameTest(unittest.TestCase):
     def test_frames_fit_every_window(self):
         cfg.settings["camera"] = "whole hole"   # the panels fit the same round any map (and this is quicker)
         rnd = a_round(4, "mixed", 7)
-        views = screens.Views(Colors("truecolor"))
+        views = camera.Views(Colors("truecolor"))
         for cols, rows in ((80, 24), (100, 30), (140, 45), (200, 60), (40, 12)):
-            for lines, _ in self.frames(screens.Playback(rnd), (cols, rows), views):
+            for lines, _ in self.frames(zen.Playback(rnd), (cols, rows), views):
                 self.assertLessEqual(len(lines), rows)
                 for l in lines:
                     self.assertLessEqual(visible_len(l), cols + 2, (cols, rows, _SGR.sub("", l)))
 
     def test_the_director_uses_every_camera(self):
         rnd = a_round(3, "tour", 2)
-        views = screens.Views(Colors("256"))
-        pb = screens.Playback(rnd)
-        screens.round_frame(FakeTerm(90, 30), pb, views.colors, views, {}, 0.0)
+        views = camera.Views(Colors("256"))
+        pb = zen.Playback(rnd)
+        zen.round_frame(FakeTerm(90, 30), pb, views.colors, views, {}, 0.0)
         views.settle()
         used = {}
         for lines, ui in self.frames(pb, (90, 30), views, steps=80, skips=1):
             used.setdefault(ui["map"].level, pb.phase)
-        self.assertEqual(set(used), {"hole", "fairway", "green"})
+        self.assertLessEqual({"hole", "fairway", "green"}, set(used))   # (and on the cup, if a putt's short)
+        self.assertLessEqual(set(used), {"hole", "fairway", "green", "cup"})
         cfg.settings["camera"] = "whole hole"
         cfg.settings["green_view"] = False
-        pb = screens.Playback(rnd)
+        pb = zen.Playback(rnd)
         levels = {ui["map"].level for _, ui in self.frames(pb, (90, 30), views, steps=60, skips=1)}
         self.assertEqual(levels, {"hole"})
 
     def test_a_new_golfer_is_a_cut_and_the_ball_is_followed(self):
         rnd = a_round(2, "tour", 3)
-        views = screens.Views(Colors("256"))
-        pb = screens.Playback(rnd)
+        views = camera.Views(Colors("256"))
+        pb = zen.Playback(rnd)
         term, ui = FakeTerm(120, 40), {}
-        screens.round_frame(term, pb, views.colors, views, ui, 0.0)
+        zen.round_frame(term, pb, views.colors, views, ui, 0.0)
         views.settle()
         pb.skip()                                           # the first golfer at address
-        screens.round_frame(term, pb, views.colors, views, ui, 0.0)
+        zen.round_frame(term, pb, views.colors, views, ui, 0.0)
         m, first = ui["map"], m_off(ui)
         self.assertEqual(m.level, "fairway")
         self.assertTrue(m.contains(pb.current().start))
         pb.skip()
         for _ in range(40):                                 # two seconds of the drive
             pb.tick(0.05, 1.0)
-            screens.round_frame(term, pb, views.colors, views, ui, 0.05)
+            zen.round_frame(term, pb, views.colors, views, ui, 0.05)
         self.assertGreater(m_off(ui)[0], first[0])          # the camera went with it
-        self.assertTrue(m.contains(screens.ball_at(pb.current(), pb.elapsed)))
+        self.assertTrue(m.contains(camera.ball_at(pb.current(), pb.elapsed)))
 
     def test_zen_and_the_panels(self):
         cfg.settings["camera"] = "whole hole"
         rnd = a_round()
-        views = screens.Views(Colors("256"))
-        pb = screens.Playback(rnd)
+        views = camera.Views(Colors("256"))
+        pb = zen.Playback(rnd)
         pb.skip()
         text = lambda lines: "\n".join(_SGR.sub("", l) for l in lines)
-        full = screens.round_frame(FakeTerm(100, 40), pb, views.colors, views, {}, 0)
+        full = zen.round_frame(FakeTerm(100, 40), pb, views.colors, views, {}, 0)
         self.assertIn("Tiny Links", text(full))
         self.assertIn("Par", text(full))
         cfg.settings["course_only"] = True
-        zen = screens.round_frame(FakeTerm(100, 40), pb, views.colors, views, {}, 0)
-        self.assertEqual(len(zen), 40)                       # all map
-        self.assertNotIn("Tiny Links", text(zen))
-        self.assertTrue(all(visible_len(l) == 100 for l in zen))
+        only = zen.round_frame(FakeTerm(100, 40), pb, views.colors, views, {}, 0)
+        self.assertEqual(len(only), 40)                      # all map
+        self.assertNotIn("Tiny Links", text(only))
+        self.assertTrue(all(visible_len(l) == 100 for l in only))
         cfg.settings.update(course_only=False, show_header=False, scorecard="off", show_group=False, show_keys=False)
-        bare = screens.round_frame(FakeTerm(100, 40), pb, views.colors, views, {}, 0)
+        bare = zen.round_frame(FakeTerm(100, 40), pb, views.colors, views, {}, 0)
         self.assertNotIn("Tiny Links", text(bare))
         self.assertEqual(len(bare), 40)                      # the map takes what the panels left
         self.assertIn(rnd.golfers[pb.current().player].short_name, text(bare[-1:]))
         cfg.settings.update(scorecard="nine")
-        card = text(screens.round_frame(FakeTerm(150, 40), pb, views.colors, views, {}, 0))
+        card = text(zen.round_frame(FakeTerm(150, 40), pb, views.colors, views, {}, 0))
         self.assertNotIn(" 18", card.split("Par")[0][-80:])
 
     def test_frame_shows_the_hole_and_scores(self):
         rnd = a_round()
-        pb = screens.Playback(rnd)
+        pb = zen.Playback(rnd)
         pb.jump_hole(1)
-        views = screens.Views(Colors("256"))
-        text = "\n".join(_SGR.sub("", l) for l in screens.round_frame(FakeTerm(120, 40), pb, views.colors, views))
+        views = camera.Views(Colors("256"))
+        text = "\n".join(_SGR.sub("", l) for l in zen.round_frame(FakeTerm(120, 40), pb, views.colors, views))
         self.assertIn("Tiny Links", text)
         self.assertIn("Hole 2", text)
         self.assertIn("Par", text)
         for g in rnd.golfers:
             self.assertIn(g.short_name, text)
+
+    def test_looking_around_and_the_keys(self):
+        rnd = a_round(2, "tour", 3)
+        views = camera.Views(Colors("256"))
+        pb = zen.Playback(rnd)
+        term, ui = FakeTerm(120, 40), {}
+        zen.round_frame(term, pb, views.colors, views, ui, 0.0)
+        pb.skip()
+        zen.round_frame(term, pb, views.colors, views, ui, 0.0)
+        start = ui["map"].center()
+        self.assertTrue(camera.look_key(ui, "l"))
+        self.assertFalse(camera.look_key(ui, "n"))         # not a key for looking: the round's
+        for key in ("right", "right", "-"):
+            self.assertTrue(camera.look_key(ui, key))
+        pb.paused = True
+        for _ in range(2):
+            lines = zen.round_frame(term, pb, views.colors, views, ui, 0.05)
+            views.settle()
+        lines = zen.round_frame(term, pb, views.colors, views, ui, 0.05)
+        m = ui["map"]
+        self.assertEqual(m.level, "look")
+        self.assertGreater(m.to_pixel(m.center())[0], m.to_pixel(start)[0])   # moved down the hole
+        self.assertIn("looking · ", _SGR.sub("", "\n".join(lines)))
+        self.assertIn("LOOKING AROUND", _SGR.sub("", lines[-1]))
+        self.assertTrue(camera.look_key(ui, "esc"))
+        self.assertFalse(ui["look"].on)
+        ui["help"] = True
+        self.assertIn("Zen: the keys", _SGR.sub("", "\n".join(zen.round_frame(term, pb, views.colors, views, ui))))
+
+    def test_a_ball_off_the_map_gets_a_map_of_its_own(self):
+        rnd = a_round(1, "tour", 3)
+        views = camera.Views(Colors("256"))
+        hole = rnd.holes[0]
+        shot = rnd.play(0).shots[0]
+        far = (shot.start[0] + 30, shot.start[1] - 400)       # sliced a quarter mile out of bounds
+        wild = sim.Shot(0, 1, "tee", "Driver", shot.start, far, far, shot.start, "ob", 500.0, 400.0)
+        scene = camera.Scene(hole, None, "pause", wild, 0.0)
+        ui = {}
+        args = (rnd.course, 100, 30, 1.0, True)
+        for _ in range(2):
+            m = camera.direct(scene, views, *args, ui, 0.0)
+            views.settle()
+        m = camera.direct(scene, views, *args, ui, 0.0)
+        self.assertEqual(m.level, "look")
+        self.assertTrue(m.contains(far))
+
+    def test_close_ups_show_the_ball_and_the_hole_at_once(self):
+        rnd = a_round(1, "tour", 3)
+        views = camera.Views(Colors("256"))
+        hole = rnd.holes[0]
+        pin = hole.pin
+        putt = lambda d: sim.Shot(0, 3, "putt", "Putter", (pin[0] - d, pin[1]), (pin[0] - d, pin[1]),
+                                  (pin[0] + 0.3, pin[1]), (pin[0], pin[1]), "green", 0.3, d)
+        args = (rnd.course, 100, 30, 1.0, True)
+        for d, level in ((3.0, "cup"), (3.9, "cup"), (25.0, "green")):
+            scene = camera.Scene(hole, None, "address", putt(d), 0.0)
+            for _ in range(2):
+                camera.direct(scene, views, *args, {}, 0.0)
+                views.settle()
+            m = camera.direct(scene, views, *args, {}, 0.0)
+            self.assertEqual(m.level, level, d)
+            self.assertTrue(m.contains(scene.shot.start) and m.contains(pin), d)
+
+    def test_looking_around_copes(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        args = (rnd.course, hole, 90, 30, 1.0, True)
+        whole = views.get(*args[:5], "hole", True, wait=True)
+        cup = views.get(*args[:5], "cup", True, wait=True)
+        look = camera.Look()
+        look.start(cup, whole, 1.0)
+        most = look.zoom
+        look.zoom_by(1, whole, 1.0)
+        self.assertEqual(look.zoom, most)                     # already as close as it goes: + doesn't zoom out
+        look.drawing = True
+        look.stop()
+        self.assertFalse(look.drawing)
+        look.start(whole, whole, 1.0)
+        look.view(views, *args[:2], 90, 30, 1.0, True, whole)
+        views.settle()
+        self.assertEqual(look.view(views, *args[:2], 90, 30, 1.0, True, whole).level, "look")
+        small = views.get(rnd.course, hole, 60, 20, 1.0, "hole", True, wait=True)   # the window got smaller
+        m = look.view(views, rnd.course, hole, 60, 20, 1.0, True, small)
+        self.assertEqual((m.cols, m.rows), (60, 20))          # not the old size's map, while the new one's made
+        views.close()
+
+    def test_the_newest_look_is_made_first_and_a_failure_is_tried_again(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        views.jobs.put((-2, 0, None))                         # hold the worker up: stopped, to look in its queue
+        views.settle()
+        for i in range(3):
+            views.get(rnd.course, hole, 60, 20, 1.0, "look", True, center=(i * 10.0, 0.0), scale=1.0)
+        views.get(rnd.course, hole, 60, 20, 1.0, "fairway", True)
+        queued = sorted(views.jobs.queue)
+        self.assertEqual([job[1][9] for _, _, job in queued[:3]], [(20.0, 0.0), (10.0, 0.0), (0.0, 0.0)])
+        self.assertEqual(queued[-1][2][1][6], "fairway")
+        broken = queued[0][2][0]
+        with mock.patch.object(camera.render, "HoleMap", side_effect=RuntimeError):
+            camera.Views._work(views, _Once(queued[0][2]))
+        self.assertNotIn(broken, views.asked)                 # it can be asked for again
+
+    def test_the_maps_in_use_are_kept_longest(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        views.KEEP = 3
+        whole = views.get(rnd.course, hole, 40, 12, 1.0, "hole", True, wait=True)
+        for i in range(5):                                   # looking around, while the whole hole's still shown
+            views.get(rnd.course, hole, 40, 12, 1.0, "look", True, wait=True, center=(i * 9.0, 0.0), scale=1.0)
+            self.assertIs(views.get(rnd.course, hole, 40, 12, 1.0, "hole", True), whole)
+        views.close()
+
+    def test_an_away_map_has_the_ball_on_it_at_any_scale(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        rng = random.Random(4)
+        for scale in (0.12, 0.5, 2.0):
+            for _ in range(6):
+                p = (rng.uniform(-300, 300), rng.uniform(-300, 300))
+                camera.away_map(views, rnd.course, hole, 60, 20, 1.0, True, p, scale)
+                views.settle()
+                m = camera.away_map(views, rnd.course, hole, 60, 20, 1.0, True, p, scale)
+                self.assertTrue(m.covers(p), (scale, p))
+        views.close()
+
+
+class _Once:
+    """A job queue with one job, then the worker's told to stop."""
+
+    def __init__(self, job):
+        self.items = [(0, 0, job), (-1, 0, None)]
+
+    def get(self):
+        return self.items.pop(0)
+
+    def task_done(self):
+        pass
 
 
 def m_off(ui):
@@ -351,13 +496,21 @@ class SettingsTest(unittest.TestCase):
             cfg.step_pace(-1)
         self.assertEqual(cfg.settings["pace"], "slow")
 
+    def test_the_menu_is_what_can_change_any_time(self):
+        keys = [k for k, _, _ in cfg.OPTIONS]
+        for k in ("mode", "player_level", "golfers", "level", "weather", "holes"):   # the round's: on its setup
+            self.assertNotIn(k, keys)
+        self.assertEqual(set(cfg.CHOICES), set(cfg.DEFAULTS) - {"tees", "last_course"})
+        text = _SGR.sub("", "\n".join(cfg.OptionsMenu(Colors("16")).render(100, 50)))
+        self.assertTrue(all(title in text for title, _ in cfg.SECTIONS))
+
     def test_menu_changes_values(self):
         menu = cfg.OptionsMenu(Colors("16"))
         menu.toggle()
-        for _ in range([k for k, _, _ in cfg.OPTIONS].index("golfers")):
+        for _ in range([k for k, _, _ in cfg.OPTIONS].index("pace")):
             menu.handle_key("down")
         menu.handle_key("right")
-        self.assertEqual(cfg.settings["golfers"], 4)
+        self.assertEqual(cfg.settings["pace"], "quick")
         lines = menu.render(80, 24)
         self.assertEqual(len(lines), 24)
         menu.handle_key("esc")

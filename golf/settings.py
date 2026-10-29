@@ -5,7 +5,7 @@ import os
 import textwrap
 
 from .files import CONFIG_DIR, write_atomic
-from .term import BOLD, DIM, RESET, REVERSE, center, detect_color_mode, set_symbols
+from .term import BOLD, DIM, RESET, REVERSE, center, detect_color_mode, set_symbols, visible_len
 
 CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
 
@@ -41,36 +41,54 @@ DEFAULTS = {
     "last_course": "",       # "way:871993734": the course list starts on it
 }
 
-# (key, label, choices)
-OPTIONS = [
-    ("mode", "Game", ["single player", "zen"]),
-    ("player_level", "Your level", ["weekend", "scratch", "tour"]),
-    ("swing", "Your swing", ["meter", "simple"]),
-    ("meter", "Meter timing", ["easy", "normal", "hard"]),
-    ("help", "Help", ["caddie", "yardages", "none"]),
-    ("pace", "Pace between shots", ["slow", "normal", "quick", "rapid"]),
-    ("camera", "Camera", ["broadcast", "whole hole"]),
-    ("golfers", "Zen: golfers in the group", [1, 2, 3, 4]),
-    ("level", "Zen: golfers' level", ["tour", "scratch", "weekend", "mixed"]),
-    ("weather", "Weather", ["live", "random", "calm", "windy", "wet"]),
-    ("holes", "Holes", ["all", "front 9", "back 9"]),
-    ("units", "Distances", ["yards", "meters"]),
-    ("detail", "Map detail", ["auto", "high", "standard"]),
-    ("satellite_trees", "Trees from satellite", [True, False]),
-    ("relief", "Slopes on the map", ["on", "greens only", "off"]),
-    ("green_view", "Close-up on the green", [True, False]),
-    ("trails", "Shot trails", [True, False]),
-    ("layout", "Hole layout", ["auto", "across", "up"]),
-    ("course_only", "Course only (z)", [False, True]),
-    ("show_header", "Title and weather", [True, False]),
-    ("show_shot", "What each shot did", [True, False]),
-    ("show_group", "The group's standing", [True, False]),
-    ("scorecard", "Scorecard", ["auto", "nine", "off"]),
-    ("side_panel", "Side panel (wide windows)", ["auto", "off"]),
-    ("show_keys", "Key help", [True, False]),
-    ("color", "Color mode", ["auto", "truecolor", "256", "16"]),
-    ("symbols", "Symbols", ["auto", "full", "console", "ascii"]),
-]
+# What each setting can be (the first of a list is where it starts, as DEFAULTS says).
+CHOICES = {
+    "mode": ["single player", "zen"],
+    "player_level": ["weekend", "scratch", "tour"],
+    "swing": ["meter", "simple"],
+    "meter": ["easy", "normal", "hard"],
+    "help": ["caddie", "yardages", "none"],
+    "pace": ["slow", "normal", "quick", "rapid"],
+    "camera": ["broadcast", "whole hole"],
+    "golfers": [1, 2, 3, 4],
+    "level": ["tour", "scratch", "weekend", "mixed"],
+    "weather": ["live", "random", "calm", "windy", "wet"],
+    "holes": ["all", "front 9", "back 9"],
+    "units": ["yards", "meters"],
+    "detail": ["auto", "high", "standard"],
+    "satellite_trees": [True, False],
+    "relief": ["on", "greens only", "off"],
+    "green_view": [True, False],
+    "trails": [True, False],
+    "layout": ["auto", "across", "up"],
+    "course_only": [False, True],
+    "show_header": [True, False],
+    "show_shot": [True, False],
+    "show_group": [True, False],
+    "scorecard": ["auto", "nine", "off"],
+    "side_panel": ["auto", "off"],
+    "show_keys": [True, False],
+    "color": ["auto", "truecolor", "256", "16"],
+    "symbols": ["auto", "full", "console", "ascii"],
+}
+LABELS = {
+    "swing": "Your swing", "meter": "Meter timing", "help": "Help (single player)", "pace": "Pace between shots",
+    "units": "Distances", "camera": "Camera", "green_view": "Close-up on the green", "layout": "Hole layout",
+    "detail": "Map detail", "relief": "Slopes on the map", "trails": "Shot trails",
+    "satellite_trees": "Trees from satellite", "course_only": "Course only (z)", "show_header": "Title and weather",
+    "show_shot": "What each shot did", "show_group": "The group's standing", "scorecard": "Scorecard",
+    "side_panel": "Side panel (wide windows)", "show_keys": "Key help", "color": "Color mode", "symbols": "Symbols",
+}
+# The options menu (o), in sections: what can change at any time. The rest
+# (the game, your level, the group, the weather, the holes and the tees) are
+# the round's, chosen on its setup screen before it starts.
+SECTIONS = (
+    ("Playing", ("swing", "meter", "help", "pace", "units")),
+    ("Camera and map", ("camera", "green_view", "layout", "detail", "relief", "trails", "satellite_trees")),
+    ("On screen", ("course_only", "show_header", "show_shot", "show_group", "scorecard", "side_panel", "show_keys")),
+    ("Terminal", ("color", "symbols")),
+)
+OPTIONS = [(k, LABELS[k], CHOICES[k]) for _, keys in SECTIONS for k in keys]   # (key, label, choices)
 
 HINTS = {
     "mode": "Single player: you play the round, shot by shot. Zen: sit back and watch a group of made-up golfers"
@@ -96,7 +114,8 @@ HINTS = {
                " Wet: rain, and the ground soft. From the next round.",
     "holes": "The whole course, or just its front or back nine. From the next round.",
     "detail": "High: four pixels to a character (quadrant blocks). Standard: two (half blocks), for fonts without"
-              " quadrants. Auto: high unless the symbols are console or ASCII.",
+              " quadrants. Auto: high unless the symbols are console or ASCII (whose fonts lack the quadrants: with"
+              " those it's always standard).",
     "green_view": "Chips and putts are shown close up on the green.",
     "satellite_trees": "Fill in the trees OpenStreetMap leaves out (often all those between the holes) from ESA"
                        " WorldCover's satellite land cover. They play as trees. From the next course loaded.",
@@ -116,7 +135,6 @@ HINTS = {
 }
 
 PACES = {"slow": 0.5, "normal": 1.0, "quick": 2.0, "rapid": 4.0}
-CHOICES = {k: choices for k, _, choices in OPTIONS}
 
 settings = dict(DEFAULTS)
 
@@ -221,23 +239,31 @@ class OptionsMenu:
         label_w = max(len(o[1]) for o in OPTIONS)
         val_w = max(len(fmt_value(v)) for _, _, choices in OPTIONS for v in choices) + 4
         head = ["", center(BOLD + "OPTIONS" + RESET, cols), ""]
-        options = []
-        for i, (k, label, _) in enumerate(OPTIONS):
-            val = "‹ %s ›" % fmt_value(settings[k])
-            row = "  %-*s   %-*s" % (label_w, label, val_w, val)
-            if i == self.sel:
-                row = REVERSE + BOLD + row + RESET
-            options.append(center(row, cols))
+        body, at, i = [], 0, 0   # rows, and the one that's chosen
+        for title, keys in SECTIONS:
+            if body:
+                body.append("")
+            body.append(center(DIM + BOLD + ("%-*s" % (label_w + val_w + 5, title)) + RESET, cols))
+            for k in keys:
+                row = "  %-*s   %-*s" % (label_w, LABELS[k], val_w, "‹ %s ›" % fmt_value(settings[k]))
+                if i == self.sel:
+                    row, at = REVERSE + BOLD + row + RESET, len(body)
+                body.append(center(row, cols))
+                i += 1
         hint = textwrap.wrap(HINTS.get(OPTIONS[self.sel][0], ""), max(20, cols - 4))
         tail = [""] + [center(DIM + h + RESET, cols) for h in hint]
         # A short window scrolls the options, keeping the one being changed in view.
         room = max(1, rows - 1 - len(head) - len(tail))
-        if len(options) > room:
-            top = max(0, min(self.sel - room // 2, len(options) - room))
-            options = options[top:top + room]
-        lines = head + options + tail
+        if len(body) > room:
+            top = max(0, min(at - room // 2, len(body) - room))
+            body = body[top:top + room]
+        lines = head + body + tail
         if len(lines) > rows - 1:
-            lines = options + tail   # shorter still: the heading goes first
+            lines = body + tail   # shorter still: the heading goes first
         while len(lines) < rows - 1:
             lines.append("")
-        return lines[:rows - 1] + [center(DIM + "↑/↓ choose   ←/→ change   o/Esc close" + RESET, cols)]
+        foot = "↑/↓ choose   ←/→ change   o/Esc close   (the game, your level, the group and the weather: on each " \
+               "round's setup)"
+        if visible_len(foot) > cols:
+            foot = "↑/↓ choose   ←/→ change   o/Esc close"
+        return lines[:rows - 1] + [center(DIM + foot + RESET, cols)]

@@ -9,4 +9,4 @@ try:
     from golf.app import main  # noqa: E402
     main()
 except KeyboardInterrupt:   # Ctrl-C while it starts up
-    pass
+    sys.exit(130)

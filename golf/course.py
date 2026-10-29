@@ -20,7 +20,7 @@ import dataclasses
 import math
 
 from .elevation import Ground
-from .geo import Polygon, Projection, bbox, dist, path_length, project_onto, segment_distance
+from .geo import Polygon, Projection, bbox, dist, edge_distance, path_length, project_onto, segment_distance
 
 SURFACES = ("tee", "fairway", "green", "rough", "bunker", "water", "trees", "ob")
 PRIORITY = ("ob", "water", "bunker", "green", "tee", "fairway", "trees", "rough")
@@ -182,7 +182,7 @@ class Course:
         for i in range(int(x1 - x0) + 1):
             for j in range(int(y1 - y0) + 1):
                 p = (x0 + i + 0.5, y0 + j + 0.5)
-                if not green.contains(*p) or min(segment_distance(p, a, b) for a, b in edges) < PIN_EDGE:
+                if not green.contains(*p) or edge_distance(p, edges) < PIN_EDGE:
                     continue
                 cost = flat(p) + PIN_STRAY * dist(p, hole.pin)
                 if best_cost is None or cost < best_cost:

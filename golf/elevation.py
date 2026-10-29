@@ -24,7 +24,7 @@ import time
 import zlib
 
 from .files import write_atomic
-from .geo import YARDS_PER_METER, segment_distance
+from .geo import YARDS_PER_METER, edge_distance
 from .net import fetch
 
 # What a download can fail with: no answer, a cut-off or garbled one, or not the data asked for.
@@ -172,7 +172,7 @@ class Ground:
                 if poly.contains(x, y):
                     f = 1.0
                 else:
-                    d = min(segment_distance((x, y), a, b) for a, b in edges)
+                    d = edge_distance((x, y), edges)
                     if d >= GREEN_BLEND:
                         continue
                     f = 1 - d / GREEN_BLEND

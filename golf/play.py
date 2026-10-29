@@ -17,17 +17,18 @@ from . import engine, panels
 from .engine import OVERSWING
 from .geo import dist, heading, lerp, step
 from .scoring import name as score_name, to_par
-from .screens import (BOX_BG, BOX_FG, CLOSE_RANGE, CUP_RANGE, FRAME, HEIGHT, LIFT_MAX, MIN_MAP, TRAIL, TRAIL_NOW, Scene,
-                      Views, ball_at, direct, flight_time, height_at, high_detail, pause_time, roll_time, trail,
-                      with_footer)
-from .render import CLOSE_LEVELS, FLAG
+from .camera import (CLOSE_RANGE, CUP_RANGE, HEIGHT, LIFT_MAX, LOOK_KEYS, TRAIL, TRAIL_NOW, Look, Scene, Views, away_map,
+                     ball_at, direct, flight_time, height_at, high_detail, look_key, pause_time, roll_time, trail)
+from .render import FLAG
 from .settings import PACES, save_settings, settings
 from .term import BOLD, DIM, RESET, center, shorten
+from .ui import BOX_BG, BOX_FG, FRAME, MIN_MAP, fit_keys, help_screen, with_footer
 
 AIM, FINE = 1.0, 0.2          # degrees a press turns the line (half the first on and round the green)
 POWER_STEP = 0.05
 FOOT = 1 / 3                  # yards
 RISE_SHOWN = FOOT             # how far the hole must be above or below the ball for the setup to say so
+BREAK_SHOWN = 0.004           # how steep a slope across a putt's line must be (0.4%) to be read as a break
 AIM_COLOR = (255, 236, 120)
 INTRO, SUMMARY = 2.4, 8.0     # seconds (the summary: unless a key moves on sooner)
 SETTLE = 0.6                  # seconds a new shot's setup ignores space: a press meant to skip what came before
@@ -42,25 +43,33 @@ RISE = 1.0
 TIMINGS = {"easy": (0.75, 0.3), "normal": (1.0, 0.2), "hard": (1.5, 0.12)}   # (fall a second, window)
 SWEET = 0.15
 LATE_PAST = 1.25
+DOWN = 0.5                    # seconds at least from setting the power to the strike mark
+TAP = 0.08                    # seconds: presses closer together than this are a held key repeating
+LEAVE = 3.0                   # seconds to press b (or q) again to leave a round in play
 
 
 class Meter:
     """The three-press swing meter, run on the clock; timing: a TIMINGS key."""
 
     def __init__(self, now, timing="normal"):
-        self.t0, self.power, self.locked = now, None, None
+        self.t0, self.power, self.locked, self.top = now, None, None, None
         self.fall, self.window = TIMINGS.get(timing, TIMINGS["normal"])
         self.late = -self.window * LATE_PAST
 
     def value(self, now):
         if self.power is None:
             return min(OVERSWING, (now - self.t0) * RISE)
-        return self.power - (now - self.locked) * self.fall
+        return self.top - (now - self.locked) * self.fall
+
+    def lock(self, power, now):
+        """Set the power: the meter comes down from it (from higher for a soft
+        one, so there's always DOWN seconds to see the mark coming)."""
+        self.power, self.locked, self.top = power, now, max(power, DOWN * self.fall)
 
     def press(self, now):
         """Set the power (the first press after starting), or strike: (power, timing)."""
         if self.power is None:
-            self.power, self.locked = self.value(now), now
+            self.lock(self.value(now), now)
             return None
         timing = max(-1.0, min(1.0, -self.value(now) / self.window))
         return self.power, 0.0 if abs(timing) < SWEET else timing
@@ -68,7 +77,7 @@ class Meter:
     def tick(self, now):
         """(power, timing) if the meter's run out without a press, else None."""
         if self.power is None and (now - self.t0) * RISE >= OVERSWING:
-            self.power, self.locked = OVERSWING, self.t0 + OVERSWING / RISE   # all the way back
+            self.lock(OVERSWING, self.t0 + OVERSWING / RISE)   # all the way back
         if self.power is not None and self.value(now) <= self.late:
             return self.power, 1.0
         return None
@@ -129,17 +138,37 @@ def describe_aim(game):
     return "%.1f° %s of the %s" % (abs(off), "right" if off > 0 else "left", word)
 
 
-def aim_points(game):
-    """(where it lands, where it stops, whether it drops) as far as the help
-    says: with "caddie", struck as meant in the wind as it usually blows,
-    rolling out; with "yardages", where it'd come down in still air (its
-    roll, the wind and the trouble left to you); with "none", nothing."""
+def aim_shot(game):
+    """The shot as set up, as far as the help says (an engine.Shot, not
+    played): with "caddie", struck as meant in the wind as it usually blows,
+    flying and rolling out; with "yardages", where it'd come down in still
+    air (its roll, the wind and the trouble left to you); with "none", None."""
     if game.help == "caddie":
-        return game.preview()
+        return game.planned()
     if game.help == "yardages":
-        spot = game.carry_spot()
-        return spot, spot, False
-    return None, None, False
+        return game.still_air()
+    return None
+
+
+def aim_points(game):
+    """(where it lands, where it stops, whether it drops) of aim_shot; Nones with no help."""
+    shot = aim_shot(game)
+    return (shot.land, shot.end, shot.holed) if shot else (None, None, False)
+
+
+def read_words(rise, across, units):
+    """How a putt looks: "2 in uphill · breaks right to left, 1.5%"."""
+    if abs(rise) < 1 / 36:
+        slope = "level"
+    elif units == "meters":
+        slope = "%d cm %s" % (round(abs(rise) * 91.44), "uphill" if rise > 0 else "downhill")
+    else:
+        inches = abs(rise) * 36
+        size = "%d in" % round(inches) if inches < 12 else panels.feet(abs(rise), units)
+        slope = "%s %s" % (size, "uphill" if rise > 0 else "downhill")
+    if abs(across) < BREAK_SHOWN:
+        return slope + " · straight"
+    return "%s · breaks %s, %.1f%%" % (slope, "right to left" if across > 0 else "left to right", abs(across) * 100)
 
 
 def setup_lines(game, land, end, holed, units, width):
@@ -149,7 +178,7 @@ def setup_lines(game, land, end, holed, units, width):
                                              panels.left(game.to_pin, ball.lie, units),
                                              "hole" if ball.lie == "green" else "flag")
     rise = game.rise()
-    if game.help != "none" and abs(rise) >= RISE_SHOWN:
+    if game.help != "none" and abs(rise) >= RISE_SHOWN and not (s.club == "P" and game.help == "yardages"):
         head += " · %s %s" % (panels.feet(abs(rise), units), "uphill" if rise > 0 else "downhill")
     if s.club == "P":
         setup = "Putter   Line ←→ %s   Length ↑↓ %s" % (describe_aim(game), panels.feet(s.length, units))
@@ -175,9 +204,12 @@ def setup_lines(game, land, end, holed, units, width):
             where, engine.club(cad.club).name, "" if cad.kind in ("full", "putt") else
             ", " + engine.BY_TYPE[cad.kind].name.lower())
     elif s.club == "P":
-        past = s.length - game.to_pin
-        note = "Rolls %s on the flat (%s %s the hole); the green, and your stroke, do the rest" % (
-            panels.feet(s.length, units), panels.feet(abs(past), units), "past" if past >= 0 else "short of")
+        rolls = game.flat_roll(s.length)   # (less than its length over the fringe)
+        past = rolls - game.to_pin
+        note = "Rolls %s on the flat (%s %s the hole)" % (panels.feet(rolls, units), panels.feet(abs(past), units),
+                                                          "past" if past >= 0 else "short of")
+        if game.help == "yardages":   # what you'd see crouched behind it
+            note += " · " + read_words(game.rise(), game.break_across(), units)
     else:
         note = "This swing carries %s in still air: the wind, the bounce and the roll are yours to judge" % (
             panels.yards(game.carry(), units))
@@ -186,22 +218,23 @@ def setup_lines(game, land, end, holed, units, width):
     return [shorten(head, width), BOLD + shorten(setup, width) + RESET, DIM + shorten(note, width) + RESET]
 
 
-def aim_marks(game, m, land, end, holed):
-    """The shot as set up on the map: its line, dotted, and as far as the
-    help goes (aim_points), a cross where it comes down (stops, for a putt;
-    none where it drops) and on to where it stops. With no help, the line
-    alone, as long as the shot to the flag."""
-    tints, ball = [], game.ball.pos
-    legs = [(ball, land), (land, end)] if land is not None else \
-        [(ball, step(ball, game.setup.bearing, game.to_pin))]
-    for a, b in legs:
-        n = int(dist(a, b) / max(m.pixel_yards(), 0.05))
-        for k in range(0, n + 1, 2):   # every other pixel: dotted
-            tints.append((lerp(a, b, k / max(n, 1)), AIM_COLOR, 0.75))
-    if land is None:
+def aim_marks(game, m, shot):
+    """The shot as set up on the map, dotted: as far as the help goes
+    (aim_shot), its flight curving as it will and its roll, with a cross where
+    it comes down (where it stops, for a putt; none where it drops). With no
+    help, the line alone, as long as the shot to the flag."""
+    ball = game.ball.pos
+    if shot is None:
+        path = [ball, step(ball, game.setup.bearing, game.to_pin)]
+        n = int(game.to_pin / max(m.pixel_yards(), 0.05))
+        dots = [lerp(path[0], path[1], k / max(n, 1)) for k in range(0, n + 1)]
+    else:
+        dots = trail(shot, 1e9, m.pixel_yards())
+    tints = [(p, AIM_COLOR, 0.75) for p in dots[::2]]   # every other pixel: dotted
+    if shot is None:
         return tints, []
-    cross = end if game.setup.club == "P" else land
-    return tints, [] if holed and cross is end else [(cross, "×", AIM_COLOR, True)]
+    cross = shot.end if game.setup.club == "P" else shot.land
+    return tints, [] if shot.holed and cross is shot.end else [(cross, "×", AIM_COLOR, True)]
 
 
 def summary_box(game):
@@ -244,6 +277,8 @@ class Screen:
         self.timing = None                  # how the last swing on the meter was struck
         self.flying, self.fly_i = [], 0
         self.look = "hole"                  # the camera to aim on: "hole", "target", "ball" (v)
+        self.last_go = -1e9                 # when space, Enter or → was last pressed
+        self.leaving = None                 # ("back" or "quit", when): asked once, to leave the round
 
     def go(self, phase, now):
         self.phase, self.at = phase, now
@@ -292,12 +327,22 @@ class Screen:
         return Scene(g.hole, after, "summary" if self.phase in ("summary", "done") else "intro", None, 0.0)
 
     def aim_view(self, args, land, end, dt):
-        """The map to aim on: close up on the green for the short game; else
-        the whole hole, or the fairway camera on the target or ahead of the ball (v)."""
+        """The map to aim on: close up on the green for the short game, if it
+        shows the ball, the hole and where the shot goes all at once; else the
+        whole hole, or the fairway camera on the target (with the ball too, if
+        they fit) or ahead of the ball (v). Looking around (l), the look's."""
         g, views, ui = self.game, self.views, self.ui
         course, cols, rows, aspect, quad = args
         whole = views.get(course, g.hole, cols, rows, aspect, "hole", quad, wait=True)
+        ui["whole"] = whole
+        look = ui.setdefault("look", Look())
+        if look.on:
+            m = look.view(views, course, g.hole, cols, rows, aspect, quad, whole)
+            if m is not None:
+                ui.update(map=m, shot=None)
+                return m
         m, target = whole, None
+        keep = [g.ball.pos, land, end, g.hole.pin]
         if settings["green_view"] and g.to_pin <= CLOSE_RANGE:
             close = [views.get(course, g.hole, cols, rows, aspect, "green", quad)]
             if g.setup.club == "P" or g.ball.lie == "green":   # (the cup's made ahead once on the green)
@@ -305,13 +350,23 @@ class Screen:
                 if g.setup.club == "P" and g.to_pin <= CUP_RANGE:
                     close.insert(0, cup)
             for near in close:
-                if near is not None and near.covers(g.ball.pos) and near.covers(end):
-                    m, target = near, lerp(g.ball.pos, lerp(end, g.hole.pin, 0.5), 0.5)
+                if near is not None and near.fits(keep):
+                    m, target = near, near.middle(keep)
                     break
+        if m is whole and not whole.covers(g.ball.pos):   # a ball off the hole's map: one round it
+            away = away_map(views, course, g.hole, cols, rows, aspect, quad, g.ball.pos, whole.k)
+            if away is not None:   # the ball, and where it's going if that fits too
+                both = [g.ball.pos, land]
+                m, target = away, away.middle(both) if away.fits(both) else g.ball.pos
         if m is whole and self.look != "hole":
             fairway = views.get(course, g.hole, cols, rows, aspect, "fairway", quad)
             if fairway is not None:
-                m, target = fairway, land if self.look == "target" else step(g.ball.pos, g.setup.bearing, 40)
+                m = fairway
+                if self.look == "ball":
+                    target = step(g.ball.pos, g.setup.bearing, 40)
+                else:
+                    both = [g.ball.pos, land, end]
+                    target = fairway.middle(both) if fairway.fits(both, margin=3) else land
         if target is None:
             ui.update(map=m, shot=None)
             return m
@@ -324,10 +379,27 @@ class Screen:
         return m
 
 
+HELP = (
+    ("Aiming", (("←  →", "aim (a putt: its line)"), (",  .", "aim finely"),
+                ("↑  ↓", "the club (a putt: its length, a foot at a time)"),
+                ("-  +", "how hard (a putt: its length, five feet at a time)"), ("s  S", "the kind of shot (S: back through them)"),
+                ("c", "off the putter, for a chip"), ("f", "aim at the flag"), ("r", "the caddie's play"))),
+    ("Swinging", (("space", "swing: with the meter, again to set the power, again at the | to strike it"),
+                  ("Esc", "on the meter: not this swing after all"))),
+    ("Camera", (("v", "aim on the whole hole, the target, or ahead of the ball"),
+                ("l", "look around: ←↑↓→ move the camera, + and - zoom, l, Esc or space back"),
+                ("z", "course only: nothing but the course"))),
+    ("", (("o  b  q", "options · back to the courses · quit (b and q twice, once the round's started)"),
+          ("Ctrl-L", "draw the screen again"))),
+)
+
+
 def frame(term, scr, now, dt):
     """One frame of the round you're playing."""
     g, colors = scr.game, scr.colors
     cols, rows = term.size()
+    if scr.ui.get("help"):
+        return help_screen(cols, rows, "Single player: the keys", HELP)
     units, hole = settings["units"], g.hole
     course_only = settings["course_only"]
     show = lambda key: settings[key] and not course_only
@@ -346,9 +418,23 @@ def frame(term, scr, now, dt):
     map_h = max(3, budget)
     args = (g.course, cols, map_h, term.pixel_aspect(), high_detail())
     aiming = scr.phase in ("aim", "meter")
-    land, end, holed = aim_points(g) if aiming else (None, None, False)
-    m = scr.aim_view(args, land or g.carry_spot(), end or g.carry_spot(), dt) if aiming else \
-        direct(scr.scene(now), scr.views, *args, scr.ui, dt)
+    plan = aim_shot(g) if aiming else None
+    land, end, holed = (plan.land, plan.end, plan.holed) if plan else (None, None, False)
+    scr.ui["aspect"] = args[3]
+    scr.ui["whole"] = scr.views.get(g.course, hole, cols, map_h, args[3], "hole", args[4], wait=True)   # (to look from)
+    look = scr.ui.setdefault("look", Look())
+    if aiming:
+        m = scr.aim_view(args, land or g.carry_spot(), end or g.carry_spot(), dt)
+    else:
+        m = None
+        if look.on:
+            course_, cols_, rows_, aspect, quad = args
+            whole = scr.ui["whole"] = scr.views.get(course_, hole, cols_, rows_, aspect, "hole", quad, wait=True)
+            m = look.view(scr.views, course_, hole, cols_, rows_, aspect, quad, whole)
+        if m is None:
+            m = direct(scr.scene(now), scr.views, *args, scr.ui, dt)
+        else:
+            scr.ui.update(map=m, shot=None)
 
     # The map's marks: trails, the flag, the ball, the shot set up or in the air.
     marks, labels, tints = [], [], []
@@ -359,12 +445,13 @@ def frame(term, scr, now, dt):
             if s.kind not in ("drop", "pickup"):
                 tints += [(p, g.golfer.ball, TRAIL) for p in trail(s, 1e9, step_yards)]
     if aiming:
-        more_tints, more_marks = aim_marks(g, m, land, end, holed)
+        more_tints, more_marks = aim_marks(g, m, plan)
         tints += more_tints
         marks += more_marks
-        if m.level in CLOSE_LEVELS and not holed and g.help == "caddie":
+        if m.close and not holed and g.help == "caddie":
             labels.append((end, panels.left(dist(end, hole.pin), "green", units), AIM_COLOR))
     marks.append((hole.pin, "▶", FLAG, True))   # over the aiming cross
+    pointers = []   # the ball, if the camera can't show it
     if scr.phase == "flight":
         shot, e = scr.flying[scr.fly_i], now - scr.at
         moving = ball_at(shot, e)
@@ -374,8 +461,10 @@ def frame(term, scr, now, dt):
         if lift > 0.5:
             tints.append((moving, (0, 0, 0), 0.55))   # its shadow
         marks.append((moving, "●", g.golfer.ball, True, min(LIFT_MAX, round(lift * HEIGHT / m.k / 2))))
+        pointers.append((moving, g.golfer.ball))
     elif not g.ball.holed and scr.phase != "done":
         marks.append((g.ball.pos, "●", g.golfer.ball, True))
+        pointers.append((g.ball.pos, g.golfer.ball))
         if scr.phase == "result" and m.level != "hole":
             labels.append((g.ball.pos, panels.left(g.to_pin, g.ball.lie, units), g.golfer.ball))
     box = None
@@ -385,7 +474,9 @@ def frame(term, scr, now, dt):
         box = (summary_box(g), BOX_FG, BOX_BG)
     elif scr.phase == "done":
         box = (final_box(g), BOX_FG, BOX_BG)
-    map_lines = m.lines(colors, marks, labels, box, tints)
+    elif look.on and look.drawing and course_only:
+        box = ([look.label()], BOX_FG, BOX_BG)
+    map_lines = m.lines(colors, marks, labels, box, tints, pointers)
     if course_only:
         return map_lines
 
@@ -426,26 +517,66 @@ def frame(term, scr, now, dt):
     lines += [" " + r for r in card]
     if not bottom:
         return lines[:rows]
-    if scr.phase == "aim" and g.setup.club == "P":
-        keys = "←/→ line  ,/. fine  ↑/↓ length  -/+ 5 ft  c club  r caddie  space putt  o options  b back"
+    if scr.leaving and now - scr.leaving[1] < LEAVE:
+        again = "b" if scr.leaving[0] == "back" else "q"
+        choices = ("%s again to %s (this round isn't kept)   ·   any other key to play on" % (
+            again, "leave the round" if scr.leaving[0] == "back" else "quit"), "%s again to %s" % (again, scr.leaving[0]))
+    elif look.on:
+        choices = (LOOK_KEYS,)
+    elif scr.phase == "aim" and g.setup.club == "P":
+        choices = ("←/→ line  ,/. fine  ↑/↓ length  -/+ 5 ft  c club  r caddie  l look  ? keys  space putt  b back",
+                   "←/→ line  ↑/↓ length  -/+ 5 ft  r caddie  l look  ? keys  space putt")
+    elif scr.phase == "aim":
+        choices = ("←/→ aim  ,/. fine  ↑/↓ club  s shot  -/+ power  f flag  r caddie  v view  l look  ? keys  "
+                   "space swing  b back",
+                   "←/→ aim  ↑/↓ club  s shot  -/+ power  r caddie  v view  l look  ? keys  space swing",
+                   "←/→ ↑/↓ s -/+ r v l ? space")
     else:
-        keys = {"aim": "←/→ aim  ,/. fine  ↑/↓ club  s shot  -/+ power  f flag  r caddie  v view  space swing"
-                       "  o options  b back",
-                "meter": "space: set the power, then strike at the |", "flight": "space: skip",
-                "result": "space: next shot", "intro": "space: play", "summary": "Enter: next hole",
-                "done": "Enter new round  b back  q quit"}[scr.phase]
+        choices = ({"meter": "space: set the power, then strike at the |   ·   Esc: not this swing", "flight": "space: skip  l look around",
+                    "result": "space: next shot  l look around", "intro": "space: play",
+                    "summary": "Enter: next hole  l look around",
+                    "done": "Enter new round  b back  q quit"}[scr.phase],)
     if not g.caddie_on_hand:
-        keys = keys.replace("r caddie  ", "")
-    return with_footer(lines, rows, cols, shorten(keys, cols - 2))
+        choices = tuple(k.replace("r caddie  ", "").replace(" r ", " ") for k in choices)
+    return with_footer(lines, rows, cols, fit_keys(choices, cols))
 
 
 def handle(scr, key, now, menu):
     """Act on a key: a return value ends the round."""
     g = scr.game
-    if key in ("q", "Q"):
-        return "quit"
-    if key in ("b", "esc", "\x7f"):
-        return "back"
+    if scr.ui.pop("help", False):
+        return None   # any key closes the help
+    if key == "?" and scr.phase != "meter":
+        scr.ui["help"] = True
+        return None
+    go = key in (" ", "enter", "right")   # the keys that move the round on
+    gap, before = 1e9, scr.last_go
+    if go:   # how long since the last of them: a held key repeats every few hundredths of a second
+        gap, scr.last_go = now - scr.last_go, now
+    look = scr.ui.setdefault("look", Look())
+    if look.on and key == "esc":   # done looking (b still leaves)
+        look.stop()
+        return None
+    if scr.phase == "meter" and key in ("b", "esc", "\x7f"):   # not this swing after all
+        scr.meter = None
+        scr.go("aim", now)
+        return None
+    if key in ("q", "Q", "b", "esc", "\x7f"):
+        out = "quit" if key in ("q", "Q") else "back"
+        if g.over or scr.phase == "done" or not (g.shots or any(c is not None for c in g.cards)):
+            return out   # nothing to lose
+        if scr.leaving and scr.leaving[0] == out and now - scr.leaving[1] < LEAVE:
+            return out
+        scr.leaving = (out, now)   # the footer asks for it again
+        return None
+    scr.leaving = None
+    if scr.phase != "meter" and look_key(scr.ui, key):
+        return None
+    if look.on and key in (" ", "enter"):   # done looking: back to the shot (not swinging it)
+        look.stop()
+        return None
+    if look.on and key not in ("o", "z"):   # the shot stays as it is while looking
+        return None
     if key == "o":
         menu.toggle()
     elif key == "z":
@@ -456,8 +587,13 @@ def handle(scr, key, now, menu):
     elif scr.phase == "aim":
         putting = g.setup.club == "P"
         turn = AIM * (0.5 if putting or g.to_pin <= CLOSE_RANGE else 1.0)
-        if key in ("left", "right"):
+        settled = now - scr.at >= SETTLE and gap >= SETTLE
+        if key == "right" and not settled:
+            pass   # still moving the round on (→ skips the shot and the pause): not aiming yet
+        elif key in ("left", "right"):
             g.aim(-turn if key == "left" else turn)
+            if key == "right":
+                scr.last_go = before   # aiming, not moving the round on: it doesn't hold a swing back
         elif key in (",", "."):
             g.aim(-FINE if key == "," else FINE)
         elif key in ("up", "down"):
@@ -475,6 +611,8 @@ def handle(scr, key, now, menu):
             g.change_club(1)
         elif key in ("s", "\t"):
             g.change_kind(1)
+        elif key == "S":
+            g.change_kind(-1)
         elif key == "f":
             g.aim_at_flag()
         elif key == "r":
@@ -482,23 +620,24 @@ def handle(scr, key, now, menu):
         elif key == "v":
             scr.look = {"hole": "target", "target": "ball", "ball": "hole"}[scr.look]
         elif key in (" ", "enter"):
-            if now - scr.at < SETTLE:
-                pass   # it's only just come up (on its own, perhaps as space was pressed to skip the pause)
+            if not settled:
+                pass   # only just come up, or space held, or still being pressed to skip what came before
             elif not on_meter(g):
                 scr.strike(now)
             else:
                 scr.meter = Meter(now, settings["meter"])
                 scr.go("meter", now)
     elif scr.phase == "meter" and key in (" ", "enter"):
-        struck = scr.meter.press(now)
-        if struck:
-            scr.strike(now, *struck)
-    elif scr.phase == "flight" and key in (" ", "enter", "right"):
+        if gap >= TAP:   # (not the key repeating)
+            struck = scr.meter.press(now)
+            if struck:
+                scr.strike(now, *struck)
+    elif scr.phase == "flight" and go:
         scr.fly_i = len(scr.flying) - 1
         scr.go("result", now)
-    elif scr.phase == "result" and key in (" ", "enter", "right"):
+    elif scr.phase == "result" and go:
         scr.go("summary" if g.ball.holed else "aim", now)
-    elif scr.phase == "summary" and key in (" ", "enter", "right"):
+    elif scr.phase == "summary" and go:
         scr.advance(now)
     elif scr.phase == "done" and key == "enter":
         return "again"
@@ -525,9 +664,16 @@ def play_round(term, game, colors, menu):
                 if scr.meter:
                     scr.meter = None
                     scr.go("aim", scr.at)
+                if not menu.open and settings["help"] != game.help:   # more help, or less, from the next shot
+                    game.help = settings["help"]
+                    if not game.ball.holed:
+                        game.suggest()
                 last = time.monotonic()
                 continue
-            scr.tick(now, PACES.get(settings["pace"], 1.0))
+            if scr.ui.get("help"):
+                scr.at += dt   # the help stops the round's clock
+            else:
+                scr.tick(now, PACES.get(settings["pace"], 1.0))
             term.draw(frame(term, scr, now, dt))
             busy = scr.phase in ("flight", "meter") or scr.ui.get("shot") == "aim"
             key = term.read_key(FRAME if busy else 0.1)

@@ -5,6 +5,7 @@ import unittest
 
 from tests.helpers import ROOT, at, tiny_around, tiny_course  # noqa: F401
 from golf import osm, render
+from golf.geo import dist
 from golf.term import Colors, visible_len
 
 _SGR = re.compile(r"\x1b\[[0-9;]*m")
@@ -161,6 +162,54 @@ class MapTest(unittest.TestCase):
         lines = fairway.lines(Colors("truecolor"))
         self.assertEqual(len(lines), 15)
         self.assertTrue(all(visible_len(l) == 60 for l in lines))
+
+    def test_what_fits_on_screen(self):
+        m = render.HoleMap(self.c, self.hole, 80, 20, level="green", way="across")
+        pin = self.hole.pin
+        self.assertTrue(m.fits([pin, at(self.c, 390, 0)]))
+        self.assertFalse(m.fits([pin, at(self.c, 340, 0)]))   # in the drawing, but too far apart for the screen
+        self.assertFalse(m.fits([pin, self.hole.tee]))        # not even in the drawing
+        both = [pin, at(self.c, 385, 4)]
+        m.aim(m.middle(both))
+        self.assertTrue(all(m.contains(p) for p in both))
+
+    def test_an_arrow_points_at_what_is_off_screen(self):
+        m = render.HoleMap(self.c, self.hole, 60, 15, way="across", level="fairway")
+        m.aim(self.hole.tee)
+        lines = [_SGR.sub("", l) for l in m.lines(Colors("truecolor"), pointers=[(self.hole.pin, (255, 255, 255))])]
+        self.assertEqual(lines[7][-1], "→")                   # the pin's off to the right, down the hole
+        lines = [_SGR.sub("", l) for l in m.lines(Colors("truecolor"), pointers=[(self.hole.tee, (255, 255, 255))])]
+        self.assertFalse(any(ch in render.POINTERS for l in lines for ch in l))   # the tee's on screen: no arrow
+
+    def test_a_map_keeps_its_terrain(self):
+        m = render.HoleMap(self.c, self.hole, 60, 15)
+        m.prepare(Colors("256"))
+        render._cache.clear()                                  # (other maps pushed it out of the shared cache)
+        made = m.terrain(render.PALETTE)
+        self.assertIs(m.terrain(render.PALETTE), made)
+        self.assertIsInstance(made[0][0][0], tuple)            # (kept as bytes, read back as colors)
+        self.assertEqual(len(made[0]), m.h)
+        self.assertEqual(len(made[0][0]), m.w)
+
+    def test_arrows_reach_both_edges(self):
+        m = render.HoleMap(self.c, self.hole, 60, 15, way="across", level="fairway")
+        m.aim(self.hole.pin)
+        self.assertEqual(m._edge(self.hole.tee)[::2], (0, "←"))
+        m.aim(self.hole.tee)
+        self.assertEqual(m._edge(self.hole.pin)[::2], (59, "→"))
+
+    def test_looking_around(self):
+        whole = render.HoleMap(self.c, self.hole, 60, 15)
+        spot = at(self.c, 200, 30)
+        m = render.HoleMap(self.c, self.hole, 60, 15, way=whole.way, level="look", center=spot, scale=whole.k / 4)
+        self.assertEqual((m.wc, m.k), (96, whole.k / 4))
+        m.aim(spot)
+        self.assertLess(dist(m.center(), spot), m.k * 3)
+        self.assertFalse(m.close)
+        near = render.HoleMap(self.c, self.hole, 60, 15, way=whole.way, level="look", center=self.hole.pin,
+                              scale=render.span_scale(render.CUP_SPAN, 60, 15, 1.0))
+        self.assertTrue(near.close and near.fine)              # as close as the cup's: its contours
+        self.assertEqual(len(near.lines(Colors("256"))), 15)
 
     def test_close_up_is_roomy(self):
         m = render.HoleMap(self.c, self.hole, 80, 20, level="green", way="across")

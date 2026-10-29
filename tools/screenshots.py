@@ -20,11 +20,11 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 
 import ansi2png  # noqa: E402
-from golf import catalog, game, osm, play, players, screens, sim  # noqa: E402
+from golf import camera, catalog, game, osm, play, players, screens, sim, zen  # noqa: E402
 from golf import term as tty  # noqa: E402
 from golf import weather as wx  # noqa: E402
 from golf.geo import heading, step  # noqa: E402
-from golf.settings import DEFAULTS, OptionsMenu, settings  # noqa: E402
+from golf.settings import DEFAULTS, OPTIONS, OptionsMenu, settings  # noqa: E402
 
 OUT = os.path.join(ROOT, "images")
 COLS, ROWS = 120, 40
@@ -92,18 +92,18 @@ def zen_frame(rnd, colors, hole_i, until, cols=COLS, rows=ROWS, limit=20000):
     """The frame when until(playback) first holds on the round's hole_i-th
     hole, its playback run on frame by frame as the app's is (so the camera
     has followed the ball there), with every map it asks for made."""
-    pb = screens.Playback(rnd)
+    pb = zen.Playback(rnd)
     while pb.hole_i < hole_i:
         pb.jump_hole(1)
-    views, ui, term = screens.Views(colors), {}, Screen(cols, rows)
+    views, ui, term = camera.Views(colors), {}, Screen(cols, rows)
     try:
         for _ in range(limit):
             if pb.phase in ("pause", "summary") and len(rnd.played) <= pb.hole_i + 1 < len(rnd.holes):
                 rnd.play(pb.hole_i + 1)
-            lines = screens.round_frame(term, pb, colors, views, ui, STEP)
+            lines = zen.round_frame(term, pb, colors, views, ui, STEP)
             views.settle()
             if until(pb):
-                return screens.round_frame(term, pb, colors, views, ui, STEP)
+                return zen.round_frame(term, pb, colors, views, ui, STEP)
             pb.tick(STEP, 1.0)
         raise RuntimeError("the moment never came")
     finally:
@@ -114,7 +114,7 @@ def in_flight(pb, player, number=None, at=0.6):
     """Golfer `player`'s shot (their number-th on the hole) at `at` of its flight."""
     s = pb.current()
     return pb.phase == "shot" and s.player == player and (number is None or s.number == number) and \
-        pb.elapsed >= screens.flight_time(s) * at
+        pb.elapsed >= camera.flight_time(s) * at
 
 
 def scene_augusta_drives(colors):
@@ -134,7 +134,7 @@ def scene_green_close_up(colors):
     shots = rnd.play(0).shots
     first = next(i for i, s in enumerate(shots) if s.kind == "putt")
     save("green-close-up", zen_frame(rnd, colors, 0, lambda pb: pb.phase == "shot" and pb.shown == first and
-                                      pb.elapsed >= screens.roll_time(shots[first]) * 0.6))
+                                      pb.elapsed >= camera.roll_time(shots[first]) * 0.6))
 
 
 def scene_sawgrass_17(colors):
@@ -148,6 +148,34 @@ def scene_sawgrass_17(colors):
         rnd.play(j)
     last = rnd.play(i).order[-1]
     save("sawgrass-17", zen_frame(rnd, colors, i, lambda pb: in_flight(pb, last, 1, at=0.85)))
+
+
+def scene_looking_around(colors):
+    """Amen Corner from above: looking around on Augusta's 12th, zoomed out to take in the 11th and 13th."""
+    reset()
+    c = course("Augusta National Golf Club")
+    hs = holes(c)
+    i = next(k for k, h in enumerate(hs) if h.number == 12)
+    rnd = sim.Round(c, players.group(3, "tour", _rng(11)), NICE_DAY, 11, hs)
+    for j in range(i + 1):
+        rnd.play(j)
+    pb = zen.Playback(rnd)
+    while pb.hole_i < i:
+        pb.jump_hole(1)
+    pb.next_phase()   # the first golfer at address
+    views, ui, term = camera.Views(colors), {}, Screen()
+    try:
+        zen.round_frame(term, pb, colors, views, ui, STEP)
+        views.settle()
+        for key in ("l", "-", "-", "-", "up"):
+            camera.look_key(ui, key)
+        pb.paused = True
+        for _ in range(3):
+            lines = zen.round_frame(term, pb, colors, views, ui, STEP)
+            views.settle()
+        save("looking-around", zen.round_frame(term, pb, colors, views, ui, STEP))
+    finally:
+        views.close()
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +247,13 @@ def scene_course_list(colors):
         save("course-list", term.frames[-1], 110, 36)
     finally:
         catalog.played = real
+
+
+def scene_options(colors):
+    reset(help="caddie")
+    menu = OptionsMenu(colors)
+    menu.sel = [k for k, _, _ in OPTIONS].index("help")
+    save("options", menu.render(110, 36), 110, 36)
 
 
 def _rng(seed):

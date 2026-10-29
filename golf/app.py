@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from . import catalog
-from .screens import course_list_screen, play_course
+from .screens import Quit, course_list_screen, play_course
 from .settings import CHOICES, CONFIG_PATH, OptionsMenu, load_settings, save_settings, settings
 from .term import SYMBOL_SETS, Colors, Terminal, detect_color_mode, set_symbols
 
@@ -54,6 +54,7 @@ def main(argv=None):
     set_symbols(args.symbols or settings["symbols"])
     menu = OptionsMenu(colors)
 
+    interrupted = False
     try:
         with Terminal() as term:
             while True:
@@ -65,7 +66,11 @@ def main(argv=None):
                 if not play_course(term, entry, menu, colors, args.seed):
                     break
                 args.seed = None
-    except KeyboardInterrupt:
+    except Quit:
         pass
+    except KeyboardInterrupt:
+        interrupted = True
     finally:
         save_settings()   # an option changed in a menu still open (Ctrl-C, a signal) isn't lost
+    if interrupted:
+        sys.exit(130)     # as a shell reports a Ctrl-C

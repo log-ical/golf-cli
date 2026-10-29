@@ -46,8 +46,9 @@ def shot_text(shot, hole, units):
     if shot.kind == "pickup":
         return "Picks up · counts %d" % shot.number
     if shot.kind == "drop":
-        return "Takes a drop · 1-stroke penalty · %s · %s to go" % (
-            LIE_WORDS.get(shot.lie, shot.lie), left(shot.to_pin, shot.lie, units))
+        return "%s · %s · %s to go" % ("Free relief off the wrong green" if shot.miss == "relief" else
+                                       "Takes a drop · 1-stroke penalty", LIE_WORDS.get(shot.lie, shot.lie),
+                                       left(shot.to_pin, shot.lie, units))
     parts = []
     if shot.kind == "putt":
         parts.append("Putt from %s" % feet(shot.from_pin, units))

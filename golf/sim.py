@@ -24,7 +24,7 @@ import dataclasses
 import math
 import random
 
-from . import clubs
+from . import clubs, engine
 from . import weather as wx
 from .engine import BY_TYPE, GUST, MAX_STROKES, PUTT_PAST, PUTTER, SCATTER, Ball, Shot, Striker, Swing  # noqa: F401
 from .geo import ahead_on_path, dist, heading, lerp, step
@@ -181,11 +181,10 @@ class Player(Striker):
         t = BY_TYPE[kind]
         lie = ball.lie if ball.lie in clubs.LIES else "rough"
         want = (d + 0.3) / (1 + t.roll)   # the carry that runs out to just past the hole
-        for key in keys:   # the first that gets there
-            club = next(c for c in clubs.BAG if c.key == key)
-            full = clubs.carry(club, lie, self.g.power) * t.carry
-            if full * 1.05 >= want:
-                break
+        reach = lambda key: clubs.carry(engine.club(key), lie, self.g.power) * t.carry
+        # The first that gets there, else the one that goes farthest.
+        key = next((k for k in keys if reach(k) * 1.05 >= want), max(keys, key=reach))
+        club, full = engine.club(key), reach(key)
         power = want / max(1.0, full)
         swing = Swing(club, heading(pos, pin), kind, min(1.05, power))
         return self.read(ball, swing, 0.3), None

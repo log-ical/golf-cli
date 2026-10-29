@@ -31,10 +31,11 @@ import math
 
 from . import clubs
 from . import weather as wx
-from .geo import along, dist, heading, lerp, path_length, project_onto, segment_distance, step
+from .geo import along, dist, heading, lerp, project_onto, segment_distance, step
 
 CUP = 0.06            # yards: the cup's radius (2.125 in)
 MAX_STROKES = 12      # a golfer who hasn't holed out by here picks up
+WRONG_GREEN = 40      # yards from the hole a green is another hole's (nearer: a part of its own, mapped apart)
 SCATTER = 0.045       # a full swing's carry: one standard deviation, as a fraction
 SHORT_SCATTER = 0.07  # a chip's or pitch's
 SHORT_AIM = 2.2       # degrees: a chip's or pitch's line, one standard deviation
@@ -42,7 +43,13 @@ PUTT_AIM, PUTT_READ = 1.5, 0.04   # a putt's line, degrees: always, and more per
 PUTT_PACE = 0.07      # a putt's length, a fraction of it, one standard deviation
 PUTT_PAST = 0.5       # yards past the hole a putt is struck to finish
 TIMING_LINE, TIMING_CURVE = 6.0, 10.0   # degrees a mistimed swing (timing 1) starts off line, and curves
+# On the swing meter the timing says which way it goes, and the golfer's own
+# scatter is still most of the rest: a pure strike (timing 0) is a little
+# straighter than their usual, and goes badly wrong less often.
+METER_SCATTER, METER_MISS = 0.8, 0.6
 OVERSWING = 1.1       # the most power a swing has (more than a full swing, less control)
+CURVE_LOFT = (1.15, 0.009)   # a club curves the ball this much, less this much for each degree of its loft:
+                             # a driver's sidespin bends it most, a wedge's backspin keeps it straighter
 GUST = 0.5            # the wind as it usually blows: halfway to its gusts (a swing's is drawn from 0 to 1)
 MISSES = ("slice", "hook", "push", "pull", "chunk", "thin", "shank")
 MISS_ODDS = (0.25, 0.15, 0.15, 0.12, 0.15, 0.15, 0.03)
@@ -145,6 +152,7 @@ class Shot:
     miss: str = ""       # what went wrong: one of MISSES, "lip out", "skull", "stays in"
     style: str = "full"  # the TYPES key it was played as
     loft: float = 1.0    # how high it flew, times a full swing
+    path: tuple = ()     # the points it rolled through, from where it came down to where it stopped (none: straight)
 
     @property
     def flown(self):
@@ -171,6 +179,11 @@ def club_keys(lie, yards):
     if lie in BY_TYPE["putt"].lies and yards <= PUTTING_RANGE:
         keys.append("P")
     return keys
+
+
+def curve_factor(club):
+    """How much a club curves the ball, times what it's swung to curve it (a driver about 1.05, a 6-iron 0.9)."""
+    return CURVE_LOFT[0] - CURVE_LOFT[1] * club.loft
 
 
 def club(key):
@@ -236,18 +249,51 @@ class Striker:
         struck just as meant, in the wind as it usually blows: what the player
         is shown when aiming. Not cup: as if the hole weren't there. trace: a
         list to put the points it rolls through in."""
+        shot = self.planned(ball, swing, cup, trace)
+        return shot.land, shot.end, shot.holed
+
+    def planned(self, ball, swing, cup=True, trace=None):
+        """The shot a swing makes struck just as meant, in the wind as it
+        usually blows, as a Shot (not played: the ball stays where it is).
+        Not cup: as if the hole weren't there. trace: a list to put every
+        point it rolls through in."""
         t = BY_TYPE[swing.kind]
         if swing.kind == "putt":
-            end, holed = self.run(ball.pos, swing.bearing, swing.length, "putt", cup, trace)
-            return ball.pos, end, holed
-        land, bend = self._flight(ball, swing, 0.0, self.g.shape * (not t.short) + t.curve, 1.0, GUST)
-        if t.short:
-            end, holed = self.run(land, heading(bend, land), self._short_run(swing, land, ball), "short", cup, trace)
+            land = ball.pos
+            rolled = [land]
+            end, holed = self.run(land, swing.bearing, swing.length, "putt", cup, rolled)
+            bend = lerp(land, end, 0.5)
         else:
-            lie = clubs.LIES.get(ball.lie, clubs.LIES["rough"])
-            roll = swing.club.roll * t.roll * lie.roll * wx.roll_factor(self.weather)
-            end, holed = self.run(land, heading(bend, land), roll, "full", cup, trace)
-        return land, end, holed
+            land, bend = self._flight(ball, swing, 0.0, self.g.shape * (not t.short) + t.curve, 1.0, GUST)
+            rolled = [land]
+            if t.short:
+                roll, how = self._short_run(swing, land, ball), "short"
+            else:
+                lie = clubs.LIES.get(ball.lie, clubs.LIES["rough"])
+                roll, how = swing.club.roll * t.roll * lie.roll * wx.roll_factor(self.weather), "full"
+            end, holed = self.run(land, heading(bend, land), roll, how, cup, rolled)
+        if trace is not None:
+            trace.extend(rolled[1:])
+        return self._unplayed(ball, swing, land, end, bend, holed, rolled)
+
+    def still_air(self, ball, swing):
+        """The shot a swing makes struck as meant in still air at 70°F, over
+        flat ground, as far as where it comes down (its curve, but no wind, no
+        slopes and no roll): what a yardage book and the club's numbers say."""
+        t = BY_TYPE[swing.kind]
+        if swing.kind == "putt":
+            end = step(ball.pos, swing.bearing, swing.length)
+            return self._unplayed(ball, swing, ball.pos, end, lerp(ball.pos, end, 0.5), False, ())
+        land, bend = self._flight(ball, swing, 0.0, self.g.shape * (not t.short) + t.curve, 1.0, 0.0,
+                                  weather=wx.Weather(), ground=False)
+        return self._unplayed(ball, swing, land, land, bend, False, ())
+
+    def _unplayed(self, ball, swing, land, end, bend, holed, rolled):
+        t = BY_TYPE[swing.kind]
+        pin = self.hole.pin
+        return Shot(self.i, ball.strokes + 1, _kind(ball, swing), swing.club.name, ball.pos, land, end, bend,
+                    "holed" if holed else self.surface(end), 0.0 if holed else dist(end, pin), dist(ball.pos, pin),
+                    holed=holed, style=swing.kind, loft=t.height, path=_rolled(rolled, end))
 
     def read(self, ball, swing, past):
         """The swing with its line and length (a putt's length, else its
@@ -288,21 +334,24 @@ class Striker:
                                             power=max(0.05, min(OVERSWING, swing.power * scale)))
         return best
 
-    def _flight(self, ball, swing, start, curve, length, gust):
+    def _flight(self, ball, swing, start, curve, length, gust, weather=None, ground=True):
         """(where it lands, the flight's bend) for a swing from the ball that
         starts `start` degrees off its line, curves `curve` degrees, and flies
         `length` times its carry, through the wind of a moment `gust` (0-1)
-        of the way to its gusts."""
+        of the way to its gusts (in weather, the day's if not given; over the
+        ground's slopes unless not ground)."""
         t = BY_TYPE[swing.kind]
+        weather = weather or self.weather
         pos = ball.pos
         fly = self.carry(swing, ball.lie)
         line = swing.bearing
-        tail, cross = self.weather.wind_on(line + start + curve / 2, gust)
-        flat = carry = max(1.0, fly * length * wx.carry_factor(self.weather, tail * t.wind))
+        curve *= curve_factor(swing.club)
+        tail, cross = weather.wind_on(line + start + curve / 2, gust)
+        flat = carry = max(1.0, fly * length * wx.carry_factor(weather, tail * t.wind))
         come_down = lambda carry: step(step(pos, line + start + curve / 2, carry), line + 90,
                                        wx.drift(cross * t.wind, carry))
         land = come_down(carry)
-        for _ in range(2 if self.ground is not None else 0):   # lower ground: farther (again, from nearer the spot)
+        for _ in range(2 if ground and self.ground is not None else 0):   # lower ground: farther (again, nearer)
             carry = flat - max(-DROP_MOST * flat, min(DROP_MOST * flat, self.rise(pos, land)))
             land = come_down(carry)
         bend = step(pos, line + start, carry * 0.55)
@@ -319,10 +368,10 @@ class Striker:
         if swing.timing is None:   # the golfer's usual
             start, curve = rng.gauss(0, spread * 0.9), rng.gauss(g.shape + t.curve, spread)
             odds = g.miss * lie.spread
-        else:                      # how the swing meter was played, and a little of the golfer's own
-            start = swing.timing * TIMING_LINE + rng.gauss(0, spread * 0.45)
-            curve = g.shape + t.curve + swing.timing * TIMING_CURVE + rng.gauss(0, spread * 0.5)
-            odds = g.miss * lie.spread * (0.3 + 3 * abs(swing.timing))
+        else:                      # how the swing meter was played, and most of the golfer's own
+            start = swing.timing * TIMING_LINE + rng.gauss(0, spread * METER_SCATTER)
+            curve = g.shape + t.curve + swing.timing * TIMING_CURVE + rng.gauss(0, spread * METER_SCATTER)
+            odds = g.miss * lie.spread * (METER_MISS + 3 * abs(swing.timing))
         odds *= 1 + max(0.0, power - 1) * 8
         length, run, miss = rng.gauss(1, SCATTER * g.accuracy), 1.0, ""
         if rng.random() < odds:
@@ -349,9 +398,10 @@ class Striker:
                 start, length = start + rng.uniform(30, 45), length * rng.uniform(0.35, 0.55)
         land, bend = self._flight(ball, swing, start, curve, length, rng.random())
         roll = swing.club.roll * t.roll * run * lie.roll * wx.roll_factor(self.weather)
-        end, holed = self.run(land, heading(bend, land), roll, "full")
-        kind = kind or ("tee" if ball.lie == "tee" else "punch" if swing.kind == "punch" else "approach")
-        return self.finish(ball, kind, swing.club.name, land, end, bend, miss, holed, swing.kind, t.height)
+        path = [land]
+        end, holed = self.run(land, heading(bend, land), roll, "full", trace=path)
+        kind = kind or _kind(ball, swing)
+        return self.finish(ball, kind, swing.club.name, land, end, bend, miss, holed, swing.kind, t.height, path)
 
     def short(self, ball, swing, kind=None):
         """A chip, pitch, flop or splash: flown part of the way and run out."""
@@ -362,11 +412,11 @@ class Striker:
         if swing.timing is None:
             start = rng.gauss(0, aim)
         else:
-            start = swing.timing * TIMING_LINE * 0.5 + rng.gauss(0, aim * 0.5)
+            start = swing.timing * TIMING_LINE * 0.5 + rng.gauss(0, aim * METER_SCATTER)
         length, miss = rng.gauss(1, SHORT_SCATTER * g.short * t.spread * lie_factor), ""
         odds = g.miss * (0.9 if swing.kind == "blast" else 0.6)
         if swing.timing is not None:
-            odds *= 0.3 + 3 * abs(swing.timing)
+            odds *= METER_MISS + 3 * abs(swing.timing)
         stays = False
         if rng.random() < odds:
             if swing.kind == "blast" and rng.random() < 0.5:
@@ -381,9 +431,10 @@ class Striker:
                                False, swing.kind, t.height)
         land, bend = self._flight(ball, swing, start, 0.0, length, rng.random())
         run = self._short_run(swing, land, ball) * (2.5 if miss == "skull" else 1.0)
-        end, holed = self.run(land, heading(bend, land), run, "short")
-        kind = kind or {"blast": "bunker", "flop": "flop"}.get(swing.kind, swing.kind)
-        return self.finish(ball, kind, swing.club.name, land, end, bend, miss, holed, swing.kind, t.height)
+        path = [land]
+        end, holed = self.run(land, heading(bend, land), run, "short", trace=path)
+        kind = kind or _kind(ball, swing)
+        return self.finish(ball, kind, swing.club.name, land, end, bend, miss, holed, swing.kind, t.height, path)
 
     def _short_run(self, swing, land, ball):
         t = BY_TYPE[swing.kind]
@@ -396,17 +447,18 @@ class Striker:
         if swing.timing is None:
             off = rng.gauss(0, line * g.putting)
         else:
-            off = swing.timing * line * 1.5 + rng.gauss(0, line * g.putting * 0.6)
+            off = swing.timing * line * 1.5 + rng.gauss(0, line * g.putting * METER_SCATTER)
         length = swing.length * max(0.2, rng.gauss(1, PUTT_PACE * g.putting)) + rng.gauss(0, 0.05)
-        end, holed = self.run(pos, swing.bearing + off, max(0.05, length), "putt")
+        path = [pos]
+        end, holed = self.run(pos, swing.bearing + off, max(0.05, length), "putt", trace=path)
         miss = ""
-        if not holed and dist(end, self.hole.pin) < 0.7 and self._passed(pos, end):
+        if not holed and dist(end, self.hole.pin) < 0.7 and self._passed(path):
             miss = "lip out"
-        return self.finish(ball, "putt", "Putter", pos, end, lerp(pos, end, 0.5), miss, holed, "putt", 0.0)
+        return self.finish(ball, "putt", "Putter", pos, end, lerp(pos, end, 0.5), miss, holed, "putt", 0.0, path)
 
-    def _passed(self, start, end):
-        """Whether a putt from start to end went over the cup (and stayed out)."""
-        return segment_distance(self.hole.pin, start, end) < CUP * 1.6
+    def _passed(self, path):
+        """Whether a putt rolling along path went over the cup (and stayed out)."""
+        return any(segment_distance(self.hole.pin, a, b) < CUP * 1.6 for a, b in zip(path, path[1:]))
 
     # ----------------------------------------------------------------------
     # The ball on the ground
@@ -471,13 +523,14 @@ class Striker:
                 break
         return p, False
 
-    def finish(self, ball, kind, club, land, end, bend, miss, holed, style="full", loft=1.0):
-        """The shot as played, the ball moved on, and any penalty drop."""
+    def finish(self, ball, kind, club, land, end, bend, miss, holed, style="full", loft=1.0, path=None):
+        """The shot as played, the ball moved on, and any penalty drop. path:
+        the points it rolled through (from land; to end, which is added)."""
         pin, start = self.hole.pin, ball.pos
         lie = "holed" if holed else self.surface(end)
         ball.strokes += 1
         shot = Shot(self.i, ball.strokes, kind, club, start, land, end, bend, lie, 0.0 if holed else dist(end, pin),
-                    dist(start, pin), holed=holed, miss=miss, style=style, loft=loft)
+                    dist(start, pin), holed=holed, miss=miss, style=style, loft=loft, path=_rolled(path, end))
         out = [shot]
         if holed:
             ball.pos, ball.lie, ball.holed = pin, "green", True
@@ -500,9 +553,28 @@ class Striker:
             elif new == "tee":
                 new = "fairway"
             out.append(self.drop(ball, end, spot, new))
+        elif lie == "green" and not self.hole.green.contains(*end) and dist(end, pin) > WRONG_GREEN:
+            # On another hole's green: free relief, the nearest spot off it no nearer the hole.
+            ball.pos, ball.lie = end, lie
+            spot = self.off_green(end)
+            if spot is not None:
+                out.append(self.drop(ball, end, spot, {"tee": "fairway"}.get(self.surface(spot), self.surface(spot))))
+                out[-1].miss = "relief"
         else:   # another hole's tee box (or a forward one) is no tee to tee it up on
             ball.pos, ball.lie = end, "fairway" if lie == "tee" else lie
         return out
+
+    def off_green(self, p):
+        """The nearest spot off the green p is on, a yard clear of it and no
+        nearer the hole, that can be played from; None if there's none near."""
+        away = heading(self.hole.pin, p)
+        for d in range(1, 60):
+            for turn in (0, 30, -30, 60, -60, 90, -90):
+                q = step(p, away + turn, d)
+                if dist(q, self.hole.pin) >= dist(p, self.hole.pin) and self.surface(q) not in \
+                        ("green", "water", "ob", "bunker") and self.surface(step(q, away + turn, -1)) != "green":
+                    return q
+        return None
 
     def drop(self, ball, at, spot, lie):
         ball.pos, ball.lie = spot, lie
@@ -515,3 +587,30 @@ class Striker:
         return [Shot(self.i, ball.strokes, "pickup", "", ball.pos, ball.pos, ball.pos, ball.pos, "holed", 0.0,
                      dist(ball.pos, self.hole.pin), holed=True, style="pickup", loft=0.0)]
 
+
+ROLL_POINTS = 60      # the most points a shot's roll is kept as
+
+
+def _kind(ball, swing):
+    """What a shot's for, as far as the swing says (a tee shot, an approach, a chip...)."""
+    if swing.kind == "putt":
+        return "putt"
+    if BY_TYPE[swing.kind].short:
+        return {"blast": "bunker"}.get(swing.kind, swing.kind)
+    return "tee" if ball.lie == "tee" else "punch" if swing.kind == "punch" else "approach"
+
+
+def _rolled(path, end):
+    """A roll's points (path, then end), thinned to ROLL_POINTS; () if it
+    went nowhere, or only in a straight line."""
+    if not path:
+        return ()
+    pts = list(path)
+    if dist(pts[-1], end) > 1e-6:
+        pts.append(end)
+    if len(pts) < 3 or all(segment_distance(p, pts[0], pts[-1]) < 0.02 for p in pts):
+        return ()   # straight: the shot's land and end say it
+    if len(pts) > ROLL_POINTS:
+        n = len(pts) - 1
+        pts = [pts[round(k * n / (ROLL_POINTS - 1))] for k in range(ROLL_POINTS)]
+    return tuple(pts)

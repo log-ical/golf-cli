@@ -160,7 +160,9 @@ class AroundTest(unittest.TestCase):
                     return json.dumps({"elements": [{"type": "relation", "id": 1, "bounds": {
                         "minlat": 39.99, "minlon": -75.01, "maxlat": 40.01, "maxlon": -74.99}}]}).encode()
                 return json.dumps(tiny_around() if "bbox" in url else tiny_course()).encode()
-            with mock.patch.object(osm, "fetch", fake_fetch):
+            # (the heights and the land cover are their own tests')
+            with mock.patch.object(osm, "fetch", fake_fetch), mock.patch.object(osm.elevation, "load", lambda *a: None), \
+                    mock.patch.object(osm.landcover, "load", lambda *a: None):
                 c = osm.load("relation", 1)[0]
                 self.assertIn("building", {f.kind for f in c.features})
                 self.assertEqual(len(asked), 3)            # the outline, the course, around it

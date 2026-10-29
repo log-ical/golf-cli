@@ -127,6 +127,7 @@ class Polygon:
         self.rings = [r for r in rings if len(r) >= 3]
         pts = [p for r in self.rings for p in r]
         self.box = bbox(pts) if pts else (0, 0, 0, 0)
+        self._bands = None   # a big one's edges by the band of y they cross (made when it's first asked about)
 
     def __bool__(self):
         return bool(self.rings)
@@ -135,14 +136,28 @@ class Polygon:
         x0, y0, x1, y1 = self.box
         if not (x0 <= x <= x1 and y0 <= y <= y1):
             return False
+        if self._bands is None:
+            self._index()
+        height, bands = self._bands
         inside = False
-        for ring in self.rings:
-            px, py = ring[-1]
-            for qx, qy in ring:
-                if (qy > y) != (py > y) and x < (px - qx) * (y - qy) / (py - qy) + qx:
-                    inside = not inside
-                px, py = qx, qy
+        for px, py, qx, qy in bands[min(len(bands) - 1, int((y - y0) / height))]:
+            if (qy > y) != (py > y) and x < (px - qx) * (y - qy) / (py - qy) + qx:
+                inside = not inside
         return inside
+
+    def _index(self):
+        """The edges by band of y: a point's only crossed by those in its band
+        (a lake's thousand edges, but a few dozen at any one y)."""
+        edges = [(px, py, qx, qy) for r in self.rings for (px, py), (qx, qy) in zip(r[-1:] + r[:-1], r)]
+        y0, y1 = self.box[1], self.box[3]
+        n = max(1, min(512, len(edges) // 8))
+        height = max(1e-9, (y1 - y0) / n)
+        bands = [[] for _ in range(n)]
+        for e in edges:
+            lo, hi = sorted((e[1], e[3]))
+            for i in range(max(0, int((lo - y0) / height)), min(n - 1, int((hi - y0) / height)) + 1):
+                bands[i].append(e)
+        self._bands = (height, bands)
 
     def centroid(self):
         """The area-weighted center of the largest ring."""
@@ -160,11 +175,30 @@ class Polygon:
 
 
 def segment_distance(p, a, b):
-    seg2 = (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2
-    if seg2 == 0:
-        return dist(p, a)
-    t = max(0.0, min(1.0, ((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / seg2))
-    return dist(p, lerp(a, b, t))
+    """Yards from p to the nearest point of the segment a-b."""
+    px, py = p
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    seg2 = dx * dx + dy * dy
+    t = 0.0 if seg2 == 0 else ((px - ax) * dx + (py - ay) * dy) / seg2
+    t = 0.0 if t < 0 else 1.0 if t > 1 else t
+    return math.hypot(px - ax - t * dx, py - ay - t * dy)
+
+
+def edge_distance(p, edges):
+    """Yards from p to the nearest of the segments in edges ((a, b), ...)."""
+    px, py = p
+    best = math.inf
+    for (ax, ay), (bx, by) in edges:
+        dx, dy = bx - ax, by - ay
+        seg2 = dx * dx + dy * dy
+        t = 0.0 if seg2 == 0 else ((px - ax) * dx + (py - ay) * dy) / seg2
+        t = 0.0 if t < 0 else 1.0 if t > 1 else t
+        ex, ey = px - ax - t * dx, py - ay - t * dy
+        d2 = ex * ex + ey * ey
+        if d2 < best:
+            best = d2
+    return math.sqrt(best)
 
 
 def assemble_rings(lines):
