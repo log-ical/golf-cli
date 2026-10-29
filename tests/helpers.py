@@ -141,5 +141,8 @@ class Plane:
     def z(self, p):
         return self.gx * p[0] + self.gy * p[1]
 
+    def zs(self, points):
+        return [self.z(p) for p in points]
+
     def slope(self, p, d=1.0):
         return self.gx, self.gy

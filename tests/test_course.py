@@ -111,6 +111,41 @@ class CoverTest(unittest.TestCase):
         again = landcover.Cover.from_json(json.loads(json.dumps(cover.to_json())))
         self.assertEqual((again.w, again.h, again.cells), (2, 2, cover.cells))
 
+    def test_cells_read_from_the_satellite_file(self):
+        import struct
+        import zlib
+        from golf import landcover
+        width, size, scale = 64, 16, 1 / 12000           # a 64-cell file in 16-cell blocks
+        x0, y0 = -83.0, 40.003                            # its north-west corner
+        value = lambda row, col: (row * 7 + col * 3) % 251
+        blocks = [zlib.compress(bytes(value(br * size + r, bc * size + c) for r in range(size) for c in range(size)))
+                  for br in range(width // size) for bc in range(width // size)]
+        head = 8 + 2 + 8 * 12 + 4
+        offsets = [head + 200 + sum(map(len, blocks[:k])) for k in range(len(blocks))]
+        extra = {324: struct.pack("<%dI" % len(blocks), *offsets),
+                 325: struct.pack("<%dI" % len(blocks), *map(len, blocks)),
+                 33550: struct.pack("<3d", scale, scale, 0), 33922: struct.pack("<6d", 0, 0, 0, x0, y0, 0)}
+        tags = [(256, 3, 1, width), (258, 3, 1, 8), (259, 3, 1, 8), (322, 3, 1, size), (324, 4, len(blocks), 0),
+                (325, 4, len(blocks), 0), (33550, 12, 3, 0), (33922, 12, 6, 0)]
+        tail, at_ = b"", head
+        ifd = struct.pack("<H", len(tags))
+        for tag, typ, cnt, val in tags:
+            if tag in extra:
+                val, tail, at_ = at_, tail + extra[tag], at_ + len(extra[tag])
+            ifd += struct.pack("<HHII", tag, typ, cnt, val)
+        data = b"II*\x00" + struct.pack("<I", 8) + ifd + struct.pack("<I", 0) + tail
+        data = data.ljust(head + 200, b"\x00") + b"".join(blocks)
+        fake = lambda url, start, end, timeout=20: data[start:end + 1]
+        b = {"minlat": 40.0, "maxlat": 40.0, "minlon": -83.0 + 20 * scale, "maxlon": -83.0 + 20 * scale}
+        with mock.patch.object(landcover, "fetch_range", side_effect=fake):
+            cover = landcover.download(b)
+        for i in range(cover.h):                          # every cell the file has, from its block
+            for j in range(cover.w):
+                row = int((y0 - (cover.north - (i + 0.5) * cover.step)) / scale)
+                col = int((cover.west + (j + 0.5) * cover.step - x0) / scale)
+                want = value(row, col) if 0 <= row < width and 0 <= col < width else 0
+                self.assertEqual(cover.cells[i * cover.w + j], want, (i, j))
+
     def test_woods_from_space_play_as_trees(self):
         from golf import landcover
         from tests.helpers import ll

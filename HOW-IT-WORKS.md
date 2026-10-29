@@ -135,13 +135,17 @@ Otherwise the camera stays wider. If the ball is somewhere the hole's maps don't
 of bounds), an arrow at the screen's edge points to it, and once the ball stops it gets a map of its own.
 
 Every map is drawn once and kept (`golf/render.py`). The closer ones are drawn bigger than the screen, so
-the camera can move about them without redrawing. They're made ahead of time on a worker thread: the next
-hole's while the group walks off the green, and a look-around map before the others.
+the camera can move about them without redrawing. They're made ahead of time, in two processes of their own
+that each have a copy of the course (so they draw at once, on other cores, without slowing the screen): the
+next hole's while the group walks off the green, and a look-around map before the others. Where processes
+can't be had, a thread draws them instead.
 
 **Looking around** (`l`) draws maps at any of 13 zoom levels, from twice the whole hole down to the cup's
-close-up. Each map is 1.6 screens wide and centered on a grid of points half a screen apart, so the
-camera can always move a little before the next one is needed. The next map in the direction you're moving
-is made ahead.
+close-up. Each map is 1.6 screens wide and centered on a grid of points half a screen apart, so the camera can
+always move a little before the next one is needed. The next map in the direction you're moving or zooming is
+made ahead, and maps for places the camera has already left are dropped from the queue. Until the map for
+where the camera is has been drawn, the screen is filled in from the maps there are, the nearest in scale
+first. That's a little blocky, but the camera never waits.
 
 The maps are drawn from above, pixel by pixel. Each shape is filled a pixel row at a time, lowest-priority
 ground first, so what's on top is what the ball plays off. Then the shading goes on:
@@ -159,9 +163,9 @@ In high detail each character holds four pixels: the quadrant block and two colo
 
 **The holes** come from OpenStreetMap. A course needs its holes mapped (`golf=hole`, a line from tee to
 green) to be playable. Many are, and the course list marks the ones already downloaded with ✓. A course
-downloads once, from the Overpass API, along with what's mapped around it (two queries at once, a minute or
-two between them). It's kept in `~/.cache/golf-cli/courses/`. If the surroundings can't be had, it plays
-without them and they're tried again next time.
+downloads once, from the Overpass API, along with what's mapped around it, its trees and its heights (below),
+all at once: a minute or two in all. It's kept in `~/.cache/golf-cli/courses/`. If the surroundings can't be
+had, it plays without them and they're tried again next time.
 
 When one boundary holds more than one course (Augusta's par-3 course, Sawgrass's Stadium and Dye's Valley),
 you choose which to play. Holes the mappers didn't assign to a course are grouped by walking from each green
@@ -179,8 +183,10 @@ as trees. *Trees from satellite* in the options turns them off.
 - **Elsewhere**, or when the USGS's server is down, they come from Mapzen's terrain tiles (SRTM and the best
   national data, tens of metres). Those show the hills but not the greens' contours.
 
-Either way they're kept with the course (about 2 MB for a US course). A pin the map puts on a slope steeper
-than 3% is moved to the flattest part of its green, the way greenkeepers cut the cup.
+Either way they're kept with the course (2 to 9 MB for a US course, stored so they read back in a tenth of a
+second). If the USGS's server is down, or there's no network, it isn't asked again and again: the terrain
+tiles stand in for a day, and then it's asked once more. A pin the map puts on a slope steeper than 3% is
+moved to the flattest part of its green, the way greenkeepers cut the cup.
 
 **What's filled in.** Anything OpenStreetMap doesn't have is made up:
 - rough wherever nothing else is mapped
@@ -203,8 +209,8 @@ A hole with fewer boxes is played from the nearest set to the one chosen.
       screens.py            the course list, loading a course, the round's setup
       zen.py                zen's round view: the playback, the group, the scorecard
       play.py               single player's round view: aiming, the swing meter, the flight
-      camera.py             how a shot moves on screen; the maps each camera shows, made ahead on a worker
-                            thread; the broadcast director; looking around
+      camera.py             how a shot moves on screen; the maps each camera shows, made ahead in their own
+                            processes; the broadcast director; looking around
       ui.py                 what the screens share: the keys along the bottom, the keys page, jobs off the
                             screen's thread
       game.py               a round you play: the caddie, your setup, your scorecard and stats

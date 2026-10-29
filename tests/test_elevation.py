@@ -1,8 +1,15 @@
 import array
+import base64
+import json
+import os
 import math
 import random
+import socket
 import struct
+import tempfile
+import time
 import unittest
+import urllib.error
 import zlib
 from unittest import mock
 
@@ -104,7 +111,23 @@ class FormatsTest(unittest.TestCase):
         hts = elevation.Heights(-100.0, 500.0, 2.0, 12, 9, z, "usgs")
         back = elevation.Heights.from_json(hts.to_json())
         self.assertEqual((back.left, back.top, back.cell, back.w, back.h, back.source), (-100.0, 500.0, 2.0, 12, 9, "usgs"))
-        self.assertLess(max(abs(a - b) for a, b in zip(z, back.z)), 0.006)   # to the centimeter
+        self.assertEqual(back.z, z)                                    # exactly
+
+    def test_older_heights_are_read_and_kept_again(self):
+        z = array.array("f", [100.0 + 0.01 * i for i in range(12 * 9)])
+        cms = [round((v - 100.0) * 100) for v in z]
+        steps = [cms[k] - (cms[k - 1] if k % 12 else cms[k - 12] if k else 0) for k in range(len(cms))]
+        old = {"v": 2, "left": -100.0, "top": 500.0, "cell": 2.0, "w": 12, "h": 9, "base": 100.0, "source": "usgs",
+               "cm": base64.b64encode(zlib.compress(struct.pack("<%di" % len(steps), *steps))).decode()}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "heights.json")
+            with open(path, "w") as f:
+                json.dump(old, f)
+            got = elevation.load(path, None)
+            self.assertLess(max(abs(a - b) for a, b in zip(z, got.z)), 0.006)   # to the centimeter
+            with open(path) as f:
+                self.assertEqual(json.load(f)["v"], 3)                        # kept again, the quicker way
+            self.assertEqual(elevation.load(path, None).z, got.z)
 
     def test_cells_without_heights(self):
         z = array.array("f", [10.0, 11.0, -3.4e38, 12.0, 13.0])
@@ -164,6 +187,35 @@ class DownloadTest(unittest.TestCase):
         with mock.patch.object(elevation, "_usgs", side_effect=OSError("502")), \
                 mock.patch.object(elevation, "_tiles", return_value="tiles"):
             self.assertEqual(elevation.download(self.US), ("tiles", False))   # the USGS is down: asked again next time
+
+    def test_tiles_stand_in_while_the_usgs_is_down(self):
+        tiles = elevation.Heights(0.0, 10.0, 5.0, 2, 2, array.array("f", [1.0, 2.0, 3.0, 4.0]), "tiles")
+        lidar = elevation.Heights(0.0, 10.0, 2.0, 2, 2, array.array("f", [5.0, 6.0, 7.0, 8.0]), "usgs")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "heights.json")
+            with mock.patch.object(elevation, "download", return_value=(tiles, False)) as down:
+                self.assertEqual(elevation.load(path, self.US).source, "tiles")
+                self.assertEqual(elevation.load(path, self.US).source, "tiles")   # kept: not downloaded again
+                self.assertEqual(down.call_count, 1)
+            with mock.patch.object(elevation.time, "time", return_value=time.time() + elevation.RETRY + 1), \
+                    mock.patch.object(elevation, "download", return_value=(lidar, True)):
+                self.assertEqual(elevation.load(path, self.US).source, "usgs")    # a day on: the USGS again
+            with mock.patch.object(elevation, "download", side_effect=AssertionError):
+                got = elevation.load(path, self.US)
+                self.assertEqual((got.source, got.retry), ("usgs", 0.0))       # and that's kept for good
+
+    def test_only_a_busy_server_is_asked_again(self):
+        busy = urllib.error.HTTPError("u", 502, "busy", None, None)
+        for failure, calls in ((busy, elevation.TRIES), (ConnectionResetError(), elevation.TRIES),
+                               (TimeoutError(), elevation.TRIES), (ConnectionRefusedError(), 1),
+                               (socket.gaierror(), 1), (urllib.error.HTTPError("u", 404, "no", None, None), 1)):
+            with mock.patch.object(elevation, "fetch", side_effect=failure) as fetch, \
+                    mock.patch.object(elevation.time, "sleep"):
+                with self.assertRaises(type(failure)):
+                    elevation._usgs(0.0, 0.0, 100.0, 100.0)
+                self.assertEqual(fetch.call_count, calls, failure)
+            if isinstance(failure, urllib.error.HTTPError):
+                failure.close()
 
 
 if __name__ == "__main__":

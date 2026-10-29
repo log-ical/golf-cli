@@ -106,6 +106,16 @@ class DrawTest(unittest.TestCase):
         out = t.draw_captured(["one", "three"])
         self.assertEqual(out, term.SYNC_BEGIN + "\x1b[2;1Hthree" + RESET + "\x1b[K" + term.SYNC_END)
 
+    def test_a_new_set_of_symbols_redraws_rows_that_havent_changed(self):
+        saved = term.symbols
+        try:
+            t = FakeTerminal(20, 2)
+            t.draw_captured(["● ball", "x"])
+            term.set_symbols("ascii")
+            self.assertIn("* ball", t.draw_captured(["● ball", "y"]))   # the same line, the new symbols
+        finally:
+            term.symbols = saved
+
     def test_lines_wider_than_the_screen_are_clipped(self):
         self.assertEqual(term.clip("\x1b[1mabcdef" + RESET, 3), "\x1b[1mabc")
         t = FakeTerminal(6, 2)

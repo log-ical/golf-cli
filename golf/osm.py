@@ -162,27 +162,31 @@ def load(kind, osm_id, refresh=False, satellite=True):
         except CourseError:
             box = None
         if box:
-            got = {}
-            jobs = {"around": lambda: download_around(box, kind, osm_id, refresh), "cover": lambda: cover(box),
-                    "heights": lambda: heights(box)}
-            workers = [threading.Thread(target=lambda k=k, f=f: got.update({k: f()}), daemon=True)
-                       for k, f in jobs.items()]
-            for w in workers:
-                w.start()
-            data = download(kind, osm_id, refresh)
-            for w in workers:
-                w.join()
-            return parse(data, kind, osm_id, got.get("around"), got.get("cover"), got.get("heights"))
+            got = _together({"data": lambda: download(kind, osm_id, refresh),
+                             "around": lambda: download_around(box, kind, osm_id, refresh),
+                             "cover": lambda: cover(box), "heights": lambda: heights(box)}, main="data")
+            return parse(got["data"], kind, osm_id, got.get("around"), got.get("cover"), got.get("heights"))
     data = download(kind, osm_id, refresh)
     box = bounds(data, kind, osm_id)
+    got = _together({"around": lambda: download_around(box, kind, osm_id, refresh), "cover": lambda: cover(box),
+                     "heights": lambda: heights(box)})
+    return parse(data, kind, osm_id, got.get("around"), got.get("cover"), got.get("heights"))
+
+
+def _together(jobs, main=None):
+    """Run the jobs ({name: function}) at once, and return their answers by
+    name. One that fails is left out, except `main`'s: that's raised (the
+    course itself, run on this thread)."""
     got = {}
-    workers = [threading.Thread(target=lambda: got.update(heights=heights(box)), daemon=True)]
+    workers = [threading.Thread(target=lambda k=k, f=f: got.update({k: f()}), daemon=True)
+               for k, f in jobs.items() if k != main]
     for w in workers:
         w.start()
-    around, cv = download_around(box, kind, osm_id, refresh), cover(box)
+    if main is not None:
+        got[main] = jobs[main]()   # (failing, the others aren't waited for)
     for w in workers:
         w.join()
-    return parse(data, kind, osm_id, around, cv, got.get("heights"))
+    return got
 
 
 def _points(geometry):
@@ -353,8 +357,12 @@ def parse(data, kind, osm_id, around=None, cover=None, heights=None):
     if not layouts:
         raise CourseError("%s isn't mapped hole by hole in OpenStreetMap" % name)
     place = ", ".join(v for v in (tags.get("addr:city"), tags.get("addr:state"), tags.get("addr:country")) if v)
-    return [Course(name, hs, features, trees, boundary, place=place, source=(kind, osm_id), layout=label,
-                   center=center, coast=coast, cover=cover, heights=heights) for label, hs in layouts]
+    courses = []
+    for label, hs in layouts:   # one Ground for them all: the same heights, the same greens
+        courses.append(Course(name, hs, features, trees, boundary, place=place, source=(kind, osm_id), layout=label,
+                              center=center, coast=coast, cover=cover, heights=heights,
+                              ground=courses[0].ground if courses else None))
+    return courses
 
 
 def _layouts(holes, course_name):

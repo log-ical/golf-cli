@@ -9,6 +9,7 @@ about 8 yards; every 10°F above 70 adds about 1%. Wet ground halves the roll.
 
 import dataclasses
 import math
+import time
 
 from .net import fetch_json, query_url
 
@@ -18,6 +19,7 @@ CODES = ((0, "clear"), (1, "mostly clear"), (2, "partly cloudy"), (3, "overcast"
          (95, "thunderstorms"))
 WET = 51          # weather codes from here up mean wet ground
 DRIFT = 0.8       # yards of drift per mph of crosswind per 150 yards of carry
+LIVE_KEEP = 600   # seconds the live weather's kept (Open-Meteo's own updates are 15 minutes apart)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,8 +63,21 @@ def roll_factor(weather):
     return 0.5 if weather.wet else 1.0
 
 
+_live = {}   # (lat, lon) -> (when it was asked, the weather then)
+
+
 def live(lat, lon):
-    """The weather at a course now."""
+    """The weather at a course now (as Open-Meteo had it in the last
+    LIVE_KEEP seconds: another round there doesn't wait for it again)."""
+    key, now = (round(lat, 3), round(lon, 3)), time.monotonic()
+    if key in _live and now - _live[key][0] < LIVE_KEEP:
+        return _live[key][1]
+    weather = _live_now(lat, lon)
+    _live[key] = (now, weather)
+    return weather
+
+
+def _live_now(lat, lon):
     data = fetch_json(query_url(OPEN_METEO, latitude="%.4f" % lat, longitude="%.4f" % lon,
                                 current="temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code",
                                 wind_speed_unit="mph", temperature_unit="fahrenheit"), timeout=15)

@@ -68,6 +68,22 @@ def path_length(path):
     return sum(dist(a, b) for a, b in zip(path, path[1:]))
 
 
+def alongs(path, ds):
+    """along(path, d) for each of ds (in order, nearest the start first), in one walk along it."""
+    out, i, start, n = [], 0, 0.0, len(path)
+    seg = dist(path[0], path[1]) if n > 1 else 0.0
+    for d in ds:
+        while i + 1 < n and (d > start + seg or seg <= 0):
+            start += seg
+            i += 1
+            seg = dist(path[i], path[i + 1]) if i + 1 < n else 0.0
+        if i + 1 >= n:
+            out.append(path[-1])
+        else:
+            out.append(lerp(path[i], path[i + 1], (d - start) / seg))
+    return out
+
+
 def along(path, d):
     """The point d yards along a path from its start (its end if past it)."""
     for a, b in zip(path, path[1:]):

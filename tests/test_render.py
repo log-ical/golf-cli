@@ -223,6 +223,9 @@ class MapTest(unittest.TestCase):
             def z(self, p):
                 return math.sin(p[0] / 5)
 
+            def zs(self, points):
+                return [self.z(p) for p in points]
+
         self.c.ground = Bumps()
         render._cache.clear()
 
@@ -239,6 +242,21 @@ class MapTest(unittest.TestCase):
         self.c.ground = None
         render._cache.clear()
         self.assertEqual(terrain("hole", "on")[0], off)                 # flat: nothing to shade
+
+    def test_trails_kept_drawn_are_as_if_drawn_afresh(self):
+        m = render.HoleMap(self.c, self.hole, 60, 16, level="fairway", way="across")
+        colors = Colors("truecolor")
+        line = lambda a, b, rgb: tuple(((a + (b - a) * t / 200, t * 0.1), rgb, 0.4) for t in range(201))
+        first, second = line(0, 300, (250, 250, 250)), line(100, 400, (250, 60, 60))
+        flying = [((150 + t, 3.0), (90, 160, 250), 0.65) for t in range(40)]
+        marks = [(self.hole.pin, "▶", render.FLAG, True)]
+        for trails in ([first], [first, second], [second]):
+            for cam in (self.hole.tee, self.hole.pin, self.hole.tee):
+                m.aim(cam)
+                kept = m.lines(colors, marks, (), None, flying, (), trails)
+                afresh = render.HoleMap(self.c, self.hole, 60, 16, level="fairway", way="across")
+                afresh.aim(cam)
+                self.assertEqual(kept, afresh.lines(colors, marks, (), None, [t for g in trails for t in g] + flying))
 
     def test_sixteen_colors(self):
         m = render.HoleMap(self.c, self.hole, 40, 10)

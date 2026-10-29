@@ -13,6 +13,7 @@ HTTP range requests. The cells round a course are cached with it.
 """
 
 import base64
+import concurrent.futures
 import json
 import math
 import os
@@ -27,6 +28,7 @@ TREES, SHRUBS = 10, 20       # WorldCover classes
 TILE_DEG = 3                 # degrees a WorldCover file covers, each way
 HEAD = 65536                 # bytes read for a file's header (its tile index is in them)
 MARGIN = 0.004               # degrees round the course's outline
+AT_ONCE = 4                  # blocks asked for at once
 
 
 class Cover:
@@ -47,6 +49,18 @@ class Cover:
         y, x = (self.north - lat) / self.step - 0.5, (lon - self.west) / self.step - 0.5
         i, j = math.floor(y), math.floor(x)
         fy, fx = y - i, x - j
+        w, cells = self.w, self.cells
+        if 0 <= i < self.h - 1 and 0 <= j < w - 1:   # all four cells in the window (the usual case, quicker)
+            k, v = i * w + j, 0.0
+            if cells[k] == TREES:
+                v += (1 - fy) * (1 - fx)
+            if cells[k + 1] == TREES:
+                v += (1 - fy) * fx
+            if cells[k + w] == TREES:
+                v += fy * (1 - fx)
+            if cells[k + w + 1] == TREES:
+                v += fy * fx
+            return v
         v = 0.0
         for di, wy in ((0, 1 - fy), (1, fy)):
             for dj, wx in ((0, 1 - fx), (1, fx)):
@@ -110,23 +124,18 @@ def download(bounds):
         url = URL.format(name)
         width, size, offsets, counts, scale, x0, y0 = _header(url)
         across = math.ceil(width / size)
-        blocks = {}
-        for i in range(h):
-            lat = north - (i + 0.5) * step
-            row = int((y0 - lat) / scale)
-            if not 0 <= row < width:
-                continue
-            for j in range(w):
-                lon = west + (j + 0.5) * step
-                col = int((lon - x0) / scale)
-                if not 0 <= col < width:
-                    continue
-                key = (row // size) * across + col // size
-                block = blocks.get(key)
-                if block is None:
-                    data = fetch_range(url, offsets[key], offsets[key] + counts[key] - 1)
-                    block = blocks[key] = zlib.decompress(data)
-                cells[i * w + j] = block[(row % size) * size + col % size]
+        # Each of the window's rows and columns: the file's row or column it's in, if it's in the file.
+        rows = [(i, row) for i, row in ((i, int((y0 - (north - (i + 0.5) * step)) / scale)) for i in range(h))
+                if 0 <= row < width]
+        cols = [(j, col) for j, col in ((j, int((west + (j + 0.5) * step - x0) / scale)) for j in range(w))
+                if 0 <= col < width]
+        keys = sorted({br * across + bc for br in {r // size for _, r in rows} for bc in {c // size for _, c in cols}})
+        with concurrent.futures.ThreadPoolExecutor(AT_ONCE) as pool:   # the blocks it takes, all at once
+            got = pool.map(lambda k: zlib.decompress(fetch_range(url, offsets[k], offsets[k] + counts[k] - 1)), keys)
+            blocks = dict(zip(keys, got))
+        for i, row in rows:
+            for j, col in cols:
+                cells[i * w + j] = blocks[(row // size) * across + col // size][(row % size) * size + col % size]
     return Cover(north, west, step, w, h, bytes(cells))
 
 

@@ -129,6 +129,7 @@ class WeatherTest(unittest.TestCase):
         from unittest import mock
         reply = {"current": {"temperature_2m": 61.5, "wind_speed_10m": 12.0, "wind_direction_10m": 250,
                              "wind_gusts_10m": 20.0, "weather_code": 61}}
+        wx._live.clear()
         with mock.patch.object(wx, "fetch_json", return_value=reply) as f:
             w = wx.live(36.56, -121.94)
         self.assertIn("latitude=36.5600", f.call_args[0][0])
@@ -136,6 +137,14 @@ class WeatherTest(unittest.TestCase):
                          (61.5, 12.0, 250.0, "live", "rain", True))
         with mock.patch.object(wx, "fetch_json", return_value={}):
             self.assertEqual(wx.live(0, 0).temp_f, 70.0)   # missing numbers: a mild day
+        with mock.patch.object(wx, "fetch_json", side_effect=AssertionError) as f:
+            self.assertEqual(wx.live(36.56, -121.94), w)     # asked a moment ago: not asked again
+        later = wx.time.monotonic() + wx.LIVE_KEEP + 1
+        with mock.patch.object(wx.time, "monotonic", return_value=later), \
+                mock.patch.object(wx, "fetch_json", return_value=reply) as f:
+            wx.live(36.56, -121.94)
+            self.assertEqual(f.call_count, 1)                 # ten minutes on, it is
+        wx._live.clear()
 
     def test_random_days_vary(self):
         days = [wx.random_day(random.Random(i)) for i in range(50)]

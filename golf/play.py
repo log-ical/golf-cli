@@ -18,7 +18,8 @@ from .engine import OVERSWING
 from .geo import dist, heading, lerp, step
 from .scoring import name as score_name, to_par
 from .camera import (CLOSE_RANGE, CUP_RANGE, HEIGHT, LIFT_MAX, LOOK_KEYS, TRAIL, TRAIL_NOW, Look, Scene, Views, away_map,
-                     ball_at, direct, flight_time, height_at, high_detail, look_key, pause_time, roll_time, trail)
+                     ball_at, direct, flight_time, height_at, high_detail, look_key, pause_time, roll_time, trail,
+                     trail_tints)
 from .render import FLAG
 from .settings import PACES, save_settings, settings
 from .term import BOLD, DIM, RESET, center, shorten
@@ -437,13 +438,11 @@ def frame(term, scr, now, dt):
             scr.ui.update(map=m, shot=None)
 
     # The map's marks: trails, the flag, the ball, the shot set up or in the air.
-    marks, labels, tints = [], [], []
+    marks, labels, tints, trails = [], [], [], []
     step_yards = m.pixel_yards() * 0.5
     done = g.shots[:len(g.shots) - len(scr.flying) + scr.fly_i] if scr.phase == "flight" else g.shots
     if settings["trails"]:
-        for s in done:
-            if s.kind not in ("drop", "pickup"):
-                tints += [(p, g.golfer.ball, TRAIL) for p in trail(s, 1e9, step_yards)]
+        trails = [trail_tints(s, g.golfer.ball, TRAIL, step_yards) for s in done if s.kind not in ("drop", "pickup")]
     if aiming:
         more_tints, more_marks = aim_marks(g, m, plan)
         tints += more_tints
@@ -476,7 +475,7 @@ def frame(term, scr, now, dt):
         box = (final_box(g), BOX_FG, BOX_BG)
     elif look.on and look.drawing and course_only:
         box = ([look.label()], BOX_FG, BOX_BG)
-    map_lines = m.lines(colors, marks, labels, box, tints, pointers)
+    map_lines = m.lines(colors, marks, labels, box, tints, pointers, trails)
     if course_only:
         return map_lines
 
@@ -675,7 +674,8 @@ def play_round(term, game, colors, menu):
             else:
                 scr.tick(now, PACES.get(settings["pace"], 1.0))
             term.draw(frame(term, scr, now, dt))
-            busy = scr.phase in ("flight", "meter") or scr.ui.get("shot") == "aim"
+            busy = scr.phase in ("flight", "meter") or scr.ui.get("shot") == "aim" or \
+                getattr(scr.ui.get("look"), "drawing", False)   # (the map looked for drawn: shown as it's done)
             key = term.read_key(FRAME if busy else 0.1)
             if key == "\x0c":
                 term.invalidate()

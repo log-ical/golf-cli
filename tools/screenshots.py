@@ -95,7 +95,7 @@ def zen_frame(rnd, colors, hole_i, until, cols=COLS, rows=ROWS, limit=20000):
     pb = zen.Playback(rnd)
     while pb.hole_i < hole_i:
         pb.jump_hole(1)
-    views, ui, term = camera.Views(colors), {}, Screen(cols, rows)
+    views, ui, term = camera.Views(colors, workers=0), {}, Screen(cols, rows)
     try:
         for _ in range(limit):
             if pb.phase in ("pause", "summary") and len(rnd.played) <= pb.hole_i + 1 < len(rnd.holes):
@@ -163,7 +163,7 @@ def scene_looking_around(colors):
     while pb.hole_i < i:
         pb.jump_hole(1)
     pb.next_phase()   # the first golfer at address
-    views, ui, term = camera.Views(colors), {}, Screen()
+    views, ui, term = camera.Views(colors, workers=0), {}, Screen()
     try:
         zen.round_frame(term, pb, colors, views, ui, STEP)
         views.settle()

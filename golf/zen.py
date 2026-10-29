@@ -5,7 +5,8 @@ import time
 
 from . import panels, render
 from .camera import (HEIGHT, LIFT_MAX, LOOK_KEYS, TRAIL, TRAIL_NOW, Look, Scene, Views, ball_at, direct,
-                     flight_time, height_at, high_detail, look_key, pause_time, roll_time, trail)
+                     flight_time, height_at, high_detail, look_key, pause_time, roll_time, trail,
+                     trail_tints)
 from .geo import dist, heading
 from .panels import YELLOW
 from .scoring import name as score_name, standings, to_par
@@ -256,7 +257,7 @@ def watch_round(term, rnd, colors, menu):
             if pb.phase in ("pause", "summary") and len(rnd.played) <= pb.hole_i + 1 < len(rnd.holes):
                 rnd.play(pb.hole_i + 1)   # simulated while nothing moves, not as the next hole starts
             term.draw(round_frame(term, pb, colors, views, ui, dt))
-            moving = pb.phase == "shot" and not pb.paused
+            moving = pb.phase == "shot" and not pb.paused or getattr(ui.get("look"), "drawing", False)
             key = term.read_key(FRAME if moving or ui.get("cam_moving") else 0.1)
             if key is not None and ui.pop("help", False):
                 continue   # any key closes the help
@@ -360,12 +361,11 @@ def round_frame(term, pb, colors, views, ui=None, dt=0.0):
     rest = {}
     for s in done:
         rest[s.player] = s
-    marks, labels, tints = [], [], []
+    marks, labels, tints, trails = [], [], [], []
     step_yards = m.pixel_yards() * 0.5   # half a pixel: an unbroken line of them
     if settings["trails"]:
-        for s in done:
-            if s.kind not in ("drop", "pickup"):
-                tints += [(p, golfers[s.player].ball, TRAIL) for p in trail(s, 1e9, step_yards)]
+        trails = [trail_tints(s, golfers[s.player].ball, TRAIL, step_yards) for s in done
+                  if s.kind not in ("drop", "pickup")]
     moving = None
     if pb.phase == "shot":
         moving = ball_at(current, pb.elapsed)
@@ -407,7 +407,7 @@ def round_frame(term, pb, colors, views, ui=None, dt=0.0):
         box = (["Course only · z for the rest"], BOX_FG, BOX_BG)
     elif course_only and look.on:
         box = ([look.label()], BOX_FG, BOX_BG) if look.drawing else None
-    map_lines = m.lines(colors, marks, labels, box, tints, pointers)
+    map_lines = m.lines(colors, marks, labels, box, tints, pointers, trails)
     if course_only:
         return map_lines
 

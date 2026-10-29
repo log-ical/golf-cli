@@ -153,8 +153,9 @@ Press `l` in either mode to take the camera yourself:
 - `+` and `-` zoom in and out: from twice the whole hole (to see the holes round it) down to the cup.
 - `l` or `Esc` hands the camera back (in single player, `space` does too, without swinging).
 
-Zen keeps playing while you look (`space` pauses it). A new map takes a moment to draw the first time
-(the header says "drawing…"). Wherever the camera is, an arrow at the screen's edge points to a ball that's
+Zen keeps playing while you look (`space` pauses it). The camera moves the moment you press a key. Where
+it hasn't been before, the view is a little blocky for a fraction of a second (the header says "drawing…")
+while the sharp map is drawn. Wherever the camera is, an arrow at the screen's edge points to a ball that's
 out of view.
 
 ## Keys

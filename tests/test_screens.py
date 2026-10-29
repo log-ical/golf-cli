@@ -7,10 +7,10 @@ import unittest
 from unittest import mock
 
 from tests.helpers import ROOT, tiny_course  # noqa: F401
-from golf import camera, catalog, osm, panels, players, scoring, screens, sim, zen
+from golf import camera, catalog, osm, panels, players, render, scoring, screens, sim, zen
 from golf import settings as cfg
 from golf import weather as wx
-from golf.geo import dist
+from golf.geo import dist, step
 from golf.term import Colors, visible_len
 
 _SGR = re.compile(r"\x1b\[[0-9;]*m")
@@ -308,6 +308,116 @@ class FrameTest(unittest.TestCase):
         with mock.patch.object(camera.render, "HoleMap", side_effect=RuntimeError):
             camera.Views._work(views, _Once(queued[0][2]))
         self.assertNotIn(broken, views.asked)                 # it can be asked for again
+
+    def test_a_stand_in_while_a_look_is_drawn(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        whole = views.get(rnd.course, hole, 60, 20, 1.0, "hole", True, wait=True)
+        c, k = whole.center(), whole.k / 2
+        look = views.get(rnd.course, hole, 60, 20, 1.0, "look", True, wait=True, center=c, scale=k)
+        stand_in = views.preview(rnd.course, hole, 60, 20, 1.0, True, c, k)
+        self.assertEqual((stand_in.cols, stand_in.rows, stand_in.w, stand_in.h), (60, 20, 120, 40))   # the screen's
+        pixels, theirs = stand_in.terrain(render.PALETTE)[0], look.terrain(render.PALETTE)[0]
+        same = sum(pixels[y][x] == theirs[int(py)][int(px)] for y in range(stand_in.h) for x in range(stand_in.w)
+                   for px, py in [look.to_pixel(stand_in.to_course(x + 0.5, y + 0.5))])
+        self.assertGreater(same, 0.97 * stand_in.w * stand_in.h)   # drawn from the look at its own scale
+        far = views.preview(rnd.course, hole, 60, 20, 1.0, True, step(c, 90, 2000), k)
+        self.assertEqual(set(far.terrain(render.PALETTE)[0][0]), {render.PALETTE["ob"]})   # none has it
+        views.close()
+
+    def test_looks_the_camera_has_left_arent_drawn(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        views.jobs.put((-2, 0, None))                         # hold the worker up, to look in its queue
+        views.settle()
+        args = (rnd.course, hole, 60, 20, 1.0, True)
+        views.look(*args, [((0.0, 0.0), 1.0), ((30.0, 0.0), 1.0)])
+        queued = sorted(views.jobs.queue)
+        self.assertEqual([job[1][9] for _, _, job in queued], [(0.0, 0.0), (30.0, 0.0)])   # where it is, first
+        views.look(*args, [((90.0, 0.0), 1.0)])              # the camera moved on
+        left = queued[0][2]
+        camera.Views._work(views, _Once(left))
+        self.assertNotIn(left[0], views.ready)               # not drawn
+        self.assertNotIn(left[0], views.asked)               # (and asked again if it's wanted again)
+        camera.Views._work(views, _Once(sorted(views.jobs.queue)[0][2]))
+        self.assertEqual(len(views.ready), 1)                # where it is now: drawn
+
+    def test_looking_makes_the_next_zoom_ahead(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"))
+        whole = views.get(rnd.course, hole, 60, 20, 1.0, "hole", True, wait=True)
+        look = camera.Look()
+        look.start(whole, whole, 1.0)
+        look.zoom_by(1, whole, 1.0)
+        m = look.view(views, rnd.course, hole, 60, 20, 1.0, True, whole)
+        self.assertEqual(len(views.wanted), 2)               # this zoom, and the next one in
+        self.assertTrue(look.drawing and m.level == "look" and (m.cols, m.rows) == (60, 20))   # a stand-in meanwhile
+        views.settle()
+        self.assertFalse(look.view(views, rnd.course, hole, 60, 20, 1.0, True, whole) is m)
+        self.assertFalse(look.drawing)
+        views.close()
+
+    def test_maps_drawn_in_other_processes_are_the_same(self):
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        here, there = camera.Views(Colors("256")), camera.Views(Colors("256"), workers=2)
+        for level in ("fairway", "green", "cup"):
+            for views in (here, there):
+                views.get(rnd.course, hole, 60, 20, 1.0, level, True)
+        here.settle()
+        there.settle()
+        for level in ("fairway", "green", "cup"):
+            a, b = (v.get(rnd.course, hole, 60, 20, 1.0, level, True) for v in (here, there))
+            self.assertIsNotNone(b, level)
+            self.assertEqual(a.lines(Colors("256")), b.lines(Colors("256")), level)
+        self.assertIsNotNone(there.pool)                      # (drawn there, not here)
+        there.close()
+        here.close()
+
+    def test_maps_are_drawn_here_once_the_processes_die(self):
+        import signal
+        import time
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"), workers=1)
+        views.get(rnd.course, hole, 60, 20, 1.0, "fairway", True)
+        views.settle()
+        for p in list(views.pool._processes.values()):    # killed while idle (out of memory, say)
+            os.kill(p.pid, signal.SIGKILL)
+        until = time.monotonic() + 10
+        while not getattr(views.pool, "_broken", True) and time.monotonic() < until:
+            time.sleep(0.02)
+        for _ in range(3):                                   # (each failure's asked again)
+            views.get(rnd.course, hole, 60, 20, 1.0, "green", True)
+            views.settle()
+        self.assertIsNotNone(views.get(rnd.course, hole, 60, 20, 1.0, "green", True))
+        self.assertEqual((views.workers, views.pool), (0, None))
+        views.close()
+
+    def test_closed_while_the_processes_start_leaves_none(self):
+        import threading
+        import time
+        rnd = a_round(1, "tour", 3)
+        hole = rnd.holes[0]
+        views = camera.Views(Colors("256"), workers=1)
+        real = camera.pickle.dumps
+
+        sending = threading.Event()
+
+        def slow(*a, **k):
+            sending.set()
+            time.sleep(0.3)                                  # the round ends while the course is sent
+            return real(*a, **k)
+        with mock.patch.object(camera.pickle, "dumps", side_effect=slow):
+            views.get(rnd.course, hole, 60, 20, 1.0, "fairway", True)
+            sending.wait(5)
+            views.close()
+            views.settle()
+        self.assertIsNone(views.pool)
+        self.assertEqual(views.ready, {})
 
     def test_the_maps_in_use_are_kept_longest(self):
         rnd = a_round(1, "tour", 3)

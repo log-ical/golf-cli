@@ -15,12 +15,18 @@ ETOPO1 and others (github.com/tilezen/joerd/blob/master/docs/attribution.md).
 
 import array
 import base64
+import concurrent.futures
+import errno
 import http.client
 import itertools
 import json
 import math
+import operator
+import socket
 import struct
+import sys
 import time
+import urllib.error
 import zlib
 
 from .files import write_atomic
@@ -39,6 +45,8 @@ CHUNK = 800            # cells each way in one request
 ZOOM = 15              # the terrain tiles' most detailed (5 m cells at the equator)
 MARGIN = 0.002         # degrees round the course's outline
 TRIES = 3              # the USGS's server often answers a busy moment with a 502
+AT_ONCE = 4            # requests to a server at once (the USGS's chunks, the terrain tiles)
+RETRY = 86400          # seconds: the terrain tiles kept in the USGS's place while it's down, till it's asked again
 LOW, HIGH = -500.0, 9000.0   # meters: outside this, a cell has no height (the USGS's no-data)
 GAPS = 0.2             # more of a window than this without heights: not the USGS's to give (outside the US)
 GREEN_TILT = 0.04      # rise a yard: the most a green's surface tilts, taken as a whole
@@ -74,38 +82,64 @@ class Heights:
         self.left, self.top, self.cell, self.w, self.h = left, top, cell, w, h
         self.z = z               # array("f"), row by row
         self.source = source     # "usgs" or "tiles"
+        self.retry = 0.0         # standing in for the USGS's heights while it's down: when to ask it again (time())
 
     def at(self, lat, lon):
         x, y = merc(lat, lon)
         return _bilinear(self.z, self.w, self.h, (x - self.left) / self.cell - 0.5, (self.top - y) / self.cell - 0.5)
 
     def to_json(self):
-        """Centimeters above the lowest, each as the step from the one before
-        it in its row, and a row's first from the first of the row above (so
-        the gentle ground compresses well), however high the hills go."""
-        base, w = min(self.z), self.w
-        cms = [int(round((v - base) * 100)) for v in self.z]
-        steps = [cms[k] - (cms[k - 1] if k % w else cms[k - w] if k else 0) for k in range(len(cms))]
-        data = struct.pack("<%di" % len(steps), *steps)
-        return {"v": 2, "left": self.left, "top": self.top, "cell": self.cell, "w": w, "h": self.h, "base": base,
-                "source": self.source, "cm": base64.b64encode(zlib.compress(data, 6)).decode()}
+        """The heights as they are (32-bit floats, little-endian), their bytes
+        sorted by place (every height's first byte, then every second...), so
+        the gentle ground's high bytes compress well, and quick to read back."""
+        z = array.array("f", self.z)
+        if sys.byteorder == "big":
+            z.byteswap()
+        b = z.tobytes()
+        planes = b"".join(b[k::4] for k in range(4))
+        return {"v": 3, "left": self.left, "top": self.top, "cell": self.cell, "w": self.w, "h": self.h,
+                "source": self.source, "retry": self.retry, "f32": base64.b64encode(zlib.compress(planes, 6)).decode()}
 
     @classmethod
     def from_json(cls, d):
-        w, h, base = int(d["w"]), int(d["h"]), float(d["base"])
-        raw, v2 = zlib.decompress(base64.b64decode(d["cm"])), d.get("v") == 2
-        if len(raw) != (4 if v2 else 2) * w * h:
-            raise ValueError("heights don't fill the window")
+        w, h, v = int(d["w"]), int(d["h"]), d.get("v")
         z = array.array("f")
-        if v2:
-            steps, first = struct.unpack("<%di" % (w * h), raw), 0
+        if v == 3:
+            raw = zlib.decompress(base64.b64decode(d["f32"]))
+            if len(raw) != 4 * w * h:
+                raise ValueError("heights don't fill the window")
+            b = bytearray(len(raw))
+            for k in range(4):
+                b[k::4] = raw[k * w * h:(k + 1) * w * h]
+            z.frombytes(b)
+            if sys.byteorder == "big":
+                z.byteswap()
+            out = cls(float(d["left"]), float(d["top"]), float(d["cell"]), w, h, z, str(d.get("source", "")))
+            out.retry = float(d.get("retry") or 0.0)
+            return out
+        # The caches before: centimeters above the lowest, as steps (load() writes them again as the above).
+        base = float(d["base"])
+        raw = zlib.decompress(base64.b64decode(d["cm"]))
+        if len(raw) != (4 if v == 2 else 2) * w * h:
+            raise ValueError("heights don't fill the window")
+        if v == 2:   # each the step from the one before it in its row, a row's first from the row above's first
+            # One running sum over them all, each row's first step changed to land on that row's first height.
+            steps = struct.unpack("<%di" % (w * h), raw)
+            run, first, end = list(steps), 0, 0
             for i in range(h):
                 first += steps[i * w]
-                z.extend(base + cm / 100 for cm in itertools.accumulate(steps[i * w + 1:(i + 1) * w], initial=first))
+                run[i * w] = first - end
+                end = first + sum(steps[i * w + 1:(i + 1) * w])
+            cms = map(operator.truediv, itertools.accumulate(run), itertools.repeat(100))
+            z.extend(map(operator.add, itertools.repeat(base), cms))   # base + cm / 100, each
         else:   # the first cache: each row from 0, in steps wrapped to 16 bits
             steps = struct.unpack("<%dH" % (w * h), raw)
-            for i in range(h):
-                z.extend(base + (cm & 0xFFFF) / 100 for cm in itertools.accumulate(steps[i * w:(i + 1) * w]))
+            run, end = list(steps), 0
+            for i in range(h):   # (one running sum again, each row's first step taking it back to 0 first)
+                run[i * w] = steps[i * w] - end
+                end = sum(steps[i * w:(i + 1) * w])
+            cms = map(operator.and_, itertools.accumulate(run), itertools.repeat(0xFFFF))
+            z.extend(map(operator.add, itertools.repeat(base), map(operator.truediv, cms, itertools.repeat(100))))
         return cls(float(d["left"]), float(d["top"]), float(d["cell"]), w, h, z, str(d.get("source", "")))
 
 
@@ -120,9 +154,9 @@ class Ground:
     kept: no green is built so steep that a ball won't stop on it."""
 
     def __init__(self, heights, proj):
-        self.heights = heights
         self.w, self.h = heights.w, heights.h
-        self.cells = array.array("f", heights.z)   # its own, to tame
+        self.cells = array.array("f", heights.z)   # its own, to tame (the heights themselves aren't kept)
+        self.tamed = set()                         # the greens (their polygons' ids) tamed already
         mx, my = merc(proj.lat0, proj.lon0)
         cos = math.cos(math.radians(proj.lat0))
         self.ax = R * math.radians(1 / proj.kx) / heights.cell          # cells a yard east
@@ -132,6 +166,25 @@ class Ground:
 
     def z(self, p):
         return _bilinear(self.cells, self.w, self.h, self.bx + p[0] * self.ax, self.by - p[1] * self.ay) * YARDS_PER_METER
+
+    def zs(self, points):
+        """z(p) for each of the points (a map's pixels), in one go: _bilinear, inline."""
+        z, w, ax, ay, bx, by = self.cells, self.w, self.ax, self.ay, self.bx, self.by
+        wm, hm = w - 1.001, self.h - 1.001
+        out = []
+        for x, y in points:
+            fx, fy = bx + x * ax, by - y * ay
+            fx = wm if fx > wm else fx
+            fy = hm if fy > hm else fy
+            fx = 0.0 if fx < 0.0 else fx
+            fy = 0.0 if fy < 0.0 else fy
+            j, i = int(fx), int(fy)
+            a, b = fx - j, fy - i
+            r0 = i * w + j
+            r1 = r0 + w
+            out.append(((z[r0] * (1 - a) + z[r0 + 1] * a) * (1 - b) + (z[r1] * (1 - a) + z[r1 + 1] * a) * b)
+                       * YARDS_PER_METER)
+        return out
 
     def tilt(self, poly):
         """(rise a yard east, north) of the plane that best fits the ground in a polygon."""
@@ -156,6 +209,9 @@ class Ground:
     def tame(self, poly):
         """Ease a green's tilt back to GREEN_TILT if it's more, fading out
         over GREEN_BLEND yards round it."""
+        if id(poly) in self.tamed:
+            return False
+        self.tamed.add(id(poly))
         gx, gy = self.tilt(poly)
         steep = math.hypot(gx, gy)
         if steep <= GREEN_TILT * 1.01:
@@ -167,12 +223,15 @@ class Ground:
         fx0, fx1 = sorted((self.bx + (x0 - GREEN_BLEND) * self.ax, self.bx + (x1 + GREEN_BLEND) * self.ax))
         fy0, fy1 = sorted((self.by - (y0 - GREEN_BLEND) * self.ay, self.by - (y1 + GREEN_BLEND) * self.ay))
         for i in range(max(0, int(fy0)), min(self.h, int(fy1) + 2)):
+            y = (self.by - i) / self.ay
+            # The edges that come within GREEN_BLEND of the row: the others are too far off to matter.
+            near = [e for e in edges if min(e[0][1], e[1][1]) - GREEN_BLEND <= y <= max(e[0][1], e[1][1]) + GREEN_BLEND]
             for j in range(max(0, int(fx0)), min(self.w, int(fx1) + 2)):
-                x, y = (j - self.bx) / self.ax, (self.by - i) / self.ay   # the cell's middle, in yards
+                x = (j - self.bx) / self.ax   # the cell's middle, in yards
                 if poly.contains(x, y):
                     f = 1.0
                 else:
-                    d = edge_distance((x, y), edges)
+                    d = edge_distance((x, y), near)
                     if d >= GREEN_BLEND:
                         continue
                     f = 1 - d / GREEN_BLEND
@@ -237,23 +296,26 @@ def _usgs(x0, y0, x1, y1):
     w, h = int(math.ceil((x1 - x0) / CELL)), int(math.ceil((y1 - y0) / CELL))
     top = y0 + h * CELL
     z = array.array("f", bytes(4 * w * h))
-    for cy in range(0, h, CHUNK):
-        for cx in range(0, w, CHUNK):
-            cw, ch = min(CHUNK, w - cx), min(CHUNK, h - cy)
-            left, up = x0 + cx * CELL, top - cy * CELL
-            url = USGS.format(left, up - ch * CELL, left + cw * CELL, up, cw, ch)
-            for k in range(TRIES):
-                try:
-                    gw, gh, got = _tiff_floats(fetch(url, timeout=90))
-                    break
-                except FAILURES:
-                    if k == TRIES - 1:
-                        raise
-                    time.sleep(3 * (k + 1))
-            if (gw, gh) != (cw, ch):
-                raise ValueError("the USGS sent %dx%d cells, not %dx%d" % (gw, gh, cw, ch))
-            for i in range(ch):
-                z[(cy + i) * w + cx:(cy + i) * w + cx + cw] = got[i * cw:(i + 1) * cw]
+
+    def chunk(cx, cy):
+        cw, ch = min(CHUNK, w - cx), min(CHUNK, h - cy)
+        left, up = x0 + cx * CELL, top - cy * CELL
+        url = USGS.format(left, up - ch * CELL, left + cw * CELL, up, cw, ch)
+        for k in range(TRIES):
+            try:
+                gw, gh, got = _tiff_floats(fetch(url, timeout=90))
+                break
+            except FAILURES as e:
+                # A busy moment (a 502, a dropped connection, a timeout, something garbled) is tried again;
+                # no way to the server at all (offline) or a refusal (a 404) isn't: it would only fail again.
+                if _unreachable(e) or isinstance(e, urllib.error.HTTPError) and e.code < 500 or k == TRIES - 1:
+                    raise
+                time.sleep(2 * (k + 1))
+        if (gw, gh) != (cw, ch):
+            raise ValueError("the USGS sent %dx%d cells, not %dx%d" % (gw, gh, cw, ch))
+        for i in range(ch):
+            z[(cy + i) * w + cx:(cy + i) * w + cx + cw] = got[i * cw:(i + 1) * cw]
+    _all(chunk, [(cx, cy) for cy in range(0, h, CHUNK) for cx in range(0, w, CHUNK)])
     if not _fill(z):
         return None
     return Heights(x0, top, CELL, w, h, z, "usgs")
@@ -340,18 +402,39 @@ def _tiles(x0, y0, x1, y1):
     px = 256
     w, h = (tx1 - tx0 + 1) * px, (ty1 - ty0 + 1) * px
     z = array.array("f", bytes(4 * w * h))
-    for ty in range(ty0, ty1 + 1):
-        for tx in range(tx0, tx1 + 1):
-            tw, th, rgb = png_rgb(fetch(TILES.format(z=ZOOM, x=tx, y=ty), timeout=30))
-            if (tw, th) != (px, px):
-                raise ValueError("a %dx%d tile" % (tw, th))
-            for i in range(px):
-                row = ((ty - ty0) * px + i) * w + (tx - tx0) * px
-                for j in range(px):
-                    k = (i * px + j) * 3
-                    z[row + j] = rgb[k] * 256 + rgb[k + 1] + rgb[k + 2] / 256 - 32768
+
+    def tile(tx, ty):
+        tw, th, rgb = png_rgb(fetch(TILES.format(z=ZOOM, x=tx, y=ty), timeout=30))
+        if (tw, th) != (px, px):
+            raise ValueError("a %dx%d tile" % (tw, th))
+        for i in range(px):
+            row = ((ty - ty0) * px + i) * w + (tx - tx0) * px
+            for j in range(px):
+                k = (i * px + j) * 3
+                z[row + j] = rgb[k] * 256 + rgb[k + 1] + rgb[k + 2] / 256 - 32768
+    _all(tile, [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)])
     _fill(z)
     return Heights(tx0 * size - world / 2, world / 2 - ty0 * size, size / px, w, h, z, "tiles")
+
+
+def _unreachable(e):
+    """Whether a failure means the server can't be reached at all: no network, no such host, nobody there."""
+    return isinstance(e, (socket.gaierror, ConnectionRefusedError)) or \
+        isinstance(e, OSError) and e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN)
+
+
+def _all(job, args):
+    """job(*a) for each of args, AT_ONCE at a time; the first failure raised
+    (the rest not started)."""
+    with concurrent.futures.ThreadPoolExecutor(AT_ONCE) as pool:
+        futures = [pool.submit(job, *a) for a in args]
+        try:
+            for f in futures:
+                f.result()
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
 
 
 # --------------------------------------------------------------------------
@@ -375,21 +458,35 @@ def download(bounds):
 
 
 def load(path, bounds):
-    """The heights cached at path, else downloaded (and cached); None if neither can be had."""
+    """The heights cached at path, else downloaded (and cached); None if
+    neither can be had. Terrain tiles kept while the USGS was down stand in
+    for its heights till a day's gone by; then it's asked again."""
+    cached = None
     try:
         with open(path, encoding="utf-8") as f:
-            return Heights.from_json(json.load(f))
+            saved = json.load(f)
+        heights = Heights.from_json(saved)
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    else:
+        if not (heights.retry and bounds and time.time() >= heights.retry):
+            if saved.get("v") != 3:   # an older cache: kept again in the quicker one
+                _keep(path, heights)
+            return heights
+        cached = heights
     if not bounds:
         return None
     try:
-        heights, keep = download(bounds)
-    except Exception:
-        return None
-    if keep:
-        try:
-            write_atomic(path, json.dumps(heights.to_json()).encode())
-        except OSError:
-            pass
+        heights, final = download(bounds)
+    except Exception:   # (no network, say: the stand-in kept as it was, and the USGS asked again next time)
+        return cached
+    heights.retry = 0.0 if final else time.time() + RETRY
+    _keep(path, heights)
     return heights
+
+
+def _keep(path, heights):
+    try:
+        write_atomic(path, json.dumps(heights.to_json()).encode())
+    except OSError:
+        pass

@@ -129,13 +129,14 @@ class Hole:
 
 class Course:
     def __init__(self, name, holes, features, trees=(), boundary=None, place="", source=None, layout="",
-                 center=None, coast=(), cover=None, heights=None):
+                 center=None, coast=(), cover=None, heights=None, ground=None):
         self.name, self.place, self.layout = name, place, layout
         self.center = center     # (latitude, longitude): for the weather, the land cover and the heights
         self.cover = cover       # landcover.Cover: the trees OSM doesn't have (None: none)
         self._proj = Projection(*center) if center else None
-        # elevation.Ground: how high the ground is (None: it's all flat)
-        self.ground = Ground(heights, self._proj) if heights is not None and self._proj else None
+        # elevation.Ground: how high the ground is (None: it's all flat). Another
+        # layout's of the same course can be shared: its greens are only tamed once.
+        self.ground = ground or (Ground(heights, self._proj) if heights is not None and self._proj else None)
         self.holes = holes
         self.features = features
         self.trees = [t if isinstance(t, Tree) else Tree(t[0], t[1], TREE_RADIUS, None) for t in trees]
@@ -171,7 +172,14 @@ class Course:
         """Where a hole's pin goes: where the map has it, unless that's on a
         slope; then the flattest spot (a yard round it as flat too) PIN_EDGE
         in from the green's edge, the nearer the better."""
-        flat = lambda p: sum(math.hypot(*self.ground.slope(q, 1.5)) for q in
+        steep = {}   # point -> how steep it is there (the spots round one are the next one's too)
+
+        def slope(q):
+            s = steep.get(q)
+            if s is None:
+                s = steep[q] = math.hypot(*self.ground.slope(q, 1.5))
+            return s
+        flat = lambda p: sum(slope(q) for q in
                              (p, (p[0] + 1, p[1]), (p[0] - 1, p[1]), (p[0], p[1] + 1), (p[0], p[1] - 1))) / 5
         if flat(hole.pin) <= PIN_SLOPE:
             return hole.pin
@@ -182,10 +190,10 @@ class Course:
         for i in range(int(x1 - x0) + 1):
             for j in range(int(y1 - y0) + 1):
                 p = (x0 + i + 0.5, y0 + j + 0.5)
-                if not green.contains(*p) or edge_distance(p, edges) < PIN_EDGE:
+                if not green.contains(*p):
                     continue
                 cost = flat(p) + PIN_STRAY * dist(p, hole.pin)
-                if best_cost is None or cost < best_cost:
+                if (best_cost is None or cost < best_cost) and edge_distance(p, edges) >= PIN_EDGE:
                     best, best_cost = p, cost
         return best
 
@@ -225,11 +233,15 @@ class Course:
         over half, give or take a little for each yard (a ragged edge)."""
         if self.cover is None or self._proj is None:
             return False
-        v = self.cover.trees(*self._proj.back(*p))
-        if v <= 0.3 or v >= 0.7:
-            return v >= 0.7
-        n = ((int(p[0]) * 374761393 + int(p[1]) * 668265263) & 0xFFFF) / 0xFFFF
-        return v + (n - 0.5) * 0.4 > 0.5
+        return _wooded(self.cover.trees(*self._proj.back(*p)), p)
+
+    def wooded_many(self, points):
+        """wooded(p) for each of the points (a map's pixels), in one go."""
+        if self.cover is None or self._proj is None:
+            return [False] * len(points)
+        pr, trees = self._proj, self.cover.trees
+        lat0, lon0, kx, ky = pr.lat0, pr.lon0, pr.kx, pr.ky   # (Projection.back, inline)
+        return [_wooded(trees(lat0 + p[1] / ky, lon0 + p[0] / kx), p) for p in points]
 
     def inside(self, p, key=None):
         """Whether p is inside the course's boundary (everywhere is, without one)."""
@@ -247,6 +259,14 @@ class Course:
                           for ring in self.boundary.rings for a, b in zip(ring, ring[1:] + ring[:1]))
             side = self._sides[key] = corners[0] if len(set(corners)) == 1 and not crossed else None
         return side if side is not None else self.boundary.contains(*p)
+
+
+def _wooded(v, p):
+    """Whether a blend v of tree cells at p is a wood (see Course.wooded)."""
+    if v <= 0.3 or v >= 0.7:
+        return v >= 0.7
+    n = ((int(p[0]) * 374761393 + int(p[1]) * 668265263) & 0xFFFF) / 0xFFFF
+    return v + (n - 0.5) * 0.4 > 0.5
 
 
 def _clip(box, to):

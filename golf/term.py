@@ -308,6 +308,8 @@ class Terminal:
         self.fd = sys.stdin.fileno()
         self.old = None
         self._shown = None       # the rows on screen, as last drawn (None: unknown)
+        self._raw = []           # and the lines they were made from, with the symbols in use then
+        self._raw_symbols = None
         self._shown_size = None  # (cols, rows) they were drawn at
         self._full_at = 0.0      # time.monotonic() of the last full redraw
         self._wake = None        # (read, write) ends of the pipe signals wake read_key with
@@ -482,7 +484,13 @@ class Terminal:
         # Blanking stray control characters keeps every row one row: a
         # newline would scroll the screen. (Feed text is made printable as it
         # arrives; this is the backstop.)
-        new = [clip(translate(_UNPRINTABLE.sub(" ", lines[i])), cols) if i < n else "" for i in range(rows)]
+        raw, done = self._raw, self._shown
+        if done is None or self._shown_size != (cols, rows) or self._raw_symbols != symbols:
+            raw = done = ()
+        # (A row the same as last frame's is as it was made ready then.)
+        new = [(done[i] if i < len(raw) and raw[i] == lines[i] else
+                clip(translate(_UNPRINTABLE.sub(" ", lines[i])), cols)) if i < n else "" for i in range(rows)]
+        self._raw, self._raw_symbols = list(lines[:rows]), symbols
         old, now = self._shown, time.monotonic()
         if old is None or self._shown_size != (cols, rows) or now - self._full_at >= FULL_REDRAW_EVERY:
             # Every row, top to bottom, with no newline after the last one
